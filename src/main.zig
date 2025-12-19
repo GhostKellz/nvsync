@@ -167,8 +167,9 @@ fn infoCommand(allocator: mem.Allocator) !void {
     // VRR requirements
     std.debug.print("\nVRR Requirements:\n", .{});
     std.debug.print("  G-Sync Module:      Any NVIDIA GPU\n", .{});
-    std.debug.print("  G-Sync Compatible:  GTX 1000+, driver 440+\n", .{});
-    std.debug.print("  HDMI 2.1 VRR:       RTX 3000+, driver 470+\n", .{});
+    std.debug.print("  G-Sync Compatible:  GTX 1000+, driver 440+ (590+ recommended)\n", .{});
+    std.debug.print("  HDMI 2.1 VRR:       RTX 3000+, driver 470+ (590+ recommended)\n", .{});
+    std.debug.print("  Note: Driver 590+ has improved DPI detection and Wayland 1.20+ support\n", .{});
 
     // Compositor detection
     std.debug.print("\nCompositor Support:\n", .{});

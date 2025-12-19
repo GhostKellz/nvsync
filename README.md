@@ -4,6 +4,13 @@
 
 A comprehensive Variable Refresh Rate management tool that provides proper G-Sync, G-Sync Compatible, and VRR support for Linux gaming with full Wayland and X11 support.
 
+## Driver 590+ Optimizations
+
+nvsync 0.2.0 is optimized for NVIDIA 590.48.01+ drivers which include:
+- **Wayland 1.20+ minimum** - Full VRR support on modern Wayland compositors
+- **Improved DPI reporting** - Correct display detection (fixes Samsung Odyssey Neo G9 and similar)
+- **Better swapchain behavior** - VRR transitions remain smooth during window operations
+
 ## Overview
 
 nvsync solves the fragmented VRR experience on Linux by providing:
@@ -254,9 +261,10 @@ sudo udevadm control --reload-rules
 ## Requirements
 
 - NVIDIA GPU (GTX 1000 series or newer for VRR)
-- NVIDIA driver 470+ (545+ recommended for best VRR)
+- NVIDIA driver 590+ recommended (590.48.01+)
+  - Minimum: 470+ (basic functionality)
 - G-Sync or G-Sync Compatible monitor
-- Zig 0.12+
+- Zig 0.16+
 - Linux 5.10+ (for VRR/DRM support)
 
 ## License
