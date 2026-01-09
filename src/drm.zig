@@ -260,6 +260,39 @@ pub const DRM_IOCTL = struct {
     }
 };
 
+/// DRM object types
+pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0c0c1;
+
+/// drm_mode_obj_set_property structure for ioctl
+const drm_mode_obj_set_property = extern struct {
+    value: u64,
+    prop_id: u32,
+    obj_id: u32,
+    obj_type: u32,
+    pad: u32 = 0,
+};
+
+/// drm_mode_obj_get_properties structure for ioctl
+const drm_mode_obj_get_properties = extern struct {
+    props_ptr: u64, // pointer to u32 array
+    prop_values_ptr: u64, // pointer to u64 array
+    count_props: u32,
+    obj_id: u32,
+    obj_type: u32,
+    pad: u32 = 0,
+};
+
+/// drm_mode_get_property structure for property info
+const drm_mode_get_property = extern struct {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    prop_id: u32,
+    flags: u32,
+    name: [32]u8,
+    count_values: u32,
+    count_enum_blobs: u32,
+};
+
 /// Set VRR enabled via DRM (requires root or DRM master)
 pub fn setVrrEnabled(card: u32, connector_id: u32, enabled: bool) !void {
     var path_buf: [64]u8 = undefined;
@@ -268,15 +301,131 @@ pub fn setVrrEnabled(card: u32, connector_id: u32, enabled: bool) !void {
     const fd = posix.open(path, .{ .ACCMODE = .RDWR }, 0) catch return error.OpenFailed;
     defer posix.close(fd);
 
-    // Would need to:
-    // 1. Get connector properties (DRM_IOCTL_MODE_OBJ_GETPROPERTIES)
-    // 2. Find "vrr_enabled" property ID
-    // 3. Set property (DRM_IOCTL_MODE_OBJ_SETPROPERTY)
+    // Find the vrr_enabled property ID
+    const vrr_prop_id = try findPropertyId(fd, connector_id, "vrr_enabled");
 
-    // For now, this requires libdrm or direct ioctl implementation
-    _ = connector_id;
-    _ = enabled;
-    return error.NotImplemented;
+    // Set the property
+    var set_prop = drm_mode_obj_set_property{
+        .value = if (enabled) 1 else 0,
+        .prop_id = vrr_prop_id,
+        .obj_id = connector_id,
+        .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+    };
+
+    const result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_SETPROPERTY, @intFromPtr(&set_prop));
+    if (result != 0) {
+        return error.IoctlFailed;
+    }
+}
+
+/// Find a property ID by name for a connector
+fn findPropertyId(fd: posix.fd_t, connector_id: u32, prop_name: []const u8) !u32 {
+    // First, get property count
+    var get_props = drm_mode_obj_get_properties{
+        .props_ptr = 0,
+        .prop_values_ptr = 0,
+        .count_props = 0,
+        .obj_id = connector_id,
+        .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+    };
+
+    var result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
+    if (result != 0) return error.IoctlFailed;
+
+    if (get_props.count_props == 0) return error.PropertyNotFound;
+
+    // Allocate arrays for property IDs and values
+    var prop_ids: [64]u32 = undefined;
+    var prop_values: [64]u64 = undefined;
+
+    const count = @min(get_props.count_props, 64);
+    get_props.props_ptr = @intFromPtr(&prop_ids);
+    get_props.prop_values_ptr = @intFromPtr(&prop_values);
+    get_props.count_props = count;
+
+    result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
+    if (result != 0) return error.IoctlFailed;
+
+    // Iterate through properties to find the one we want
+    for (prop_ids[0..count]) |prop_id| {
+        var get_prop = drm_mode_get_property{
+            .values_ptr = 0,
+            .enum_blob_ptr = 0,
+            .prop_id = prop_id,
+            .flags = 0,
+            .name = [_]u8{0} ** 32,
+            .count_values = 0,
+            .count_enum_blobs = 0,
+        };
+
+        result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_GETPROPERTY, @intFromPtr(&get_prop));
+        if (result != 0) continue;
+
+        // Compare property name
+        const name_slice = mem.sliceTo(&get_prop.name, 0);
+        if (mem.eql(u8, name_slice, prop_name)) {
+            return prop_id;
+        }
+    }
+
+    return error.PropertyNotFound;
+}
+
+/// Get VRR enabled state via DRM
+pub fn getVrrEnabled(card: u32, connector_id: u32) !bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/dev/dri/card{d}", .{card}) catch return error.PathError;
+
+    const fd = posix.open(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
+    defer posix.close(fd);
+
+    // Get all properties
+    var get_props = drm_mode_obj_get_properties{
+        .props_ptr = 0,
+        .prop_values_ptr = 0,
+        .count_props = 0,
+        .obj_id = connector_id,
+        .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+    };
+
+    var result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
+    if (result != 0) return error.IoctlFailed;
+
+    if (get_props.count_props == 0) return false;
+
+    var prop_ids: [64]u32 = undefined;
+    var prop_values: [64]u64 = undefined;
+
+    const count = @min(get_props.count_props, 64);
+    get_props.props_ptr = @intFromPtr(&prop_ids);
+    get_props.prop_values_ptr = @intFromPtr(&prop_values);
+    get_props.count_props = count;
+
+    result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
+    if (result != 0) return error.IoctlFailed;
+
+    // Find vrr_enabled property
+    for (prop_ids[0..count], prop_values[0..count]) |prop_id, value| {
+        var get_prop = drm_mode_get_property{
+            .values_ptr = 0,
+            .enum_blob_ptr = 0,
+            .prop_id = prop_id,
+            .flags = 0,
+            .name = [_]u8{0} ** 32,
+            .count_values = 0,
+            .count_enum_blobs = 0,
+        };
+
+        result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_GETPROPERTY, @intFromPtr(&get_prop));
+        if (result != 0) continue;
+
+        const name_slice = mem.sliceTo(&get_prop.name, 0);
+        if (mem.eql(u8, name_slice, "vrr_enabled")) {
+            return value != 0;
+        }
+    }
+
+    return false;
 }
 
 test "DrmManager init" {

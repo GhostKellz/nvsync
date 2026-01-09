@@ -113,7 +113,7 @@ pub const NvidiaController = struct {
                         defer self.allocator.free(v);
                         break :blk mem.eql(u8, v, "1");
                     } else false,
-                    .gsync_enabled = false, // Would need to check current mode
+                    .gsync_enabled = queryGsyncEnabled(self.allocator, output) orelse false,
                     .refresh_rate = 60,
                     .vrr_min_refresh = 48,
                 };
@@ -189,6 +189,37 @@ pub fn queryNvidiaSetting(allocator: mem.Allocator, attribute: []const u8) !?[]c
     if (trimmed.len == 0) return null;
 
     return allocator.dupe(u8, trimmed) catch null;
+}
+
+/// Query if G-Sync is currently enabled on a display
+fn queryGsyncEnabled(allocator: mem.Allocator, display: []const u8) ?bool {
+    // Query current G-Sync state from nvidia-settings
+    // Check AllowGSYNC and AllowGSYNCCompatible attributes
+    const gsync = queryNvidiaDisplayAttribute(allocator, display, "AllowGSYNC");
+    if (gsync) |v| {
+        defer allocator.free(v);
+        if (mem.eql(u8, v, "1")) return true;
+    }
+
+    const gsync_compat = queryNvidiaDisplayAttribute(allocator, display, "AllowGSYNCCompatible");
+    if (gsync_compat) |v| {
+        defer allocator.free(v);
+        if (mem.eql(u8, v, "1")) return true;
+    }
+
+    // Also check the VRR indicator from CurrentMetaMode
+    const metamode = queryNvidiaSetting(allocator, "CurrentMetaMode") catch return null;
+    if (metamode) |mode| {
+        defer allocator.free(mode);
+        // Check if metamode contains G-Sync indicators
+        if (mem.indexOf(u8, mode, "AllowGSYNC") != null or
+            mem.indexOf(u8, mode, "AllowGSYNCCompatible") != null)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /// Query nvidia-settings display attribute
