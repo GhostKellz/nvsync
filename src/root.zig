@@ -12,17 +12,20 @@ const std = @import("std");
 const posix = std.posix;
 const fs = std.fs;
 const mem = std.mem;
+const Io = std.Io;
+const Dir = Io.Dir;
 
 // Sub-modules
 pub const drm = @import("drm.zig");
 pub const nvidia = @import("nvidia.zig");
 pub const wayland = @import("wayland.zig");
+pub const dbus = @import("dbus.zig");
 
 /// Library version
 pub const version = std.SemanticVersion{
     .major = 0,
     .minor = 2,
-    .patch = 0,
+    .patch = 1,
 };
 
 /// VRR Mode
@@ -175,22 +178,23 @@ pub const DisplayManager = struct {
     }
 
     fn scanDrmDevices(self: *DisplayManager) !void {
-        var dir = fs.cwd().openDir("/sys/class/drm", .{ .iterate = true }) catch return;
-        defer dir.close();
+        const io = Io.Threaded.global_single_threaded.io();
+        var dir = Dir.cwd().openDir(io, "/sys/class/drm", .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (!mem.startsWith(u8, entry.name, "card")) continue;
             if (mem.indexOf(u8, entry.name, "-") == null) continue;
 
             var path_buf: [256]u8 = undefined;
             const status_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/status", .{entry.name}) catch continue;
 
-            const file = fs.cwd().openFile(status_path, .{}) catch continue;
-            defer file.close();
+            const file = Dir.cwd().openFile(io, status_path, .{}) catch continue;
+            defer file.close(io);
 
             var status_buf: [64]u8 = undefined;
-            const status_len = file.read(&status_buf) catch continue;
+            const status_len = posix.read(file.handle, &status_buf) catch continue;
             const status = status_buf[0..status_len];
 
             const trimmed = mem.trim(u8, status, &[_]u8{ '\n', '\r', ' ' });
@@ -217,11 +221,11 @@ pub const DisplayManager = struct {
             // Read VRR capable
             const vrr_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/vrr_capable", .{entry.name}) catch "";
             if (vrr_path.len > 0) {
-                const vrr_file = fs.cwd().openFile(vrr_path, .{}) catch null;
+                const vrr_file = Dir.cwd().openFile(io, vrr_path, .{}) catch null;
                 if (vrr_file) |f| {
-                    defer f.close();
+                    defer f.close(io);
                     var vrr_buf: [8]u8 = undefined;
-                    const vrr_len = f.read(&vrr_buf) catch 0;
+                    const vrr_len = posix.read(f.handle, &vrr_buf) catch 0;
                     if (vrr_len > 0) {
                         const vrr_trimmed = mem.trim(u8, vrr_buf[0..vrr_len], &[_]u8{ '\n', '\r', ' ' });
                         display.vrr_capable = mem.eql(u8, vrr_trimmed, "1");
@@ -235,11 +239,11 @@ pub const DisplayManager = struct {
             // Check VRR enabled state
             const enabled_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/vrr_enabled", .{entry.name}) catch "";
             if (enabled_path.len > 0) {
-                const en_file = fs.cwd().openFile(enabled_path, .{}) catch null;
+                const en_file = Dir.cwd().openFile(io, enabled_path, .{}) catch null;
                 if (en_file) |f| {
-                    defer f.close();
+                    defer f.close(io);
                     var en_buf: [8]u8 = undefined;
-                    const en_len = f.read(&en_buf) catch 0;
+                    const en_len = posix.read(f.handle, &en_buf) catch 0;
                     if (en_len > 0) {
                         const en_trimmed = mem.trim(u8, en_buf[0..en_len], &[_]u8{ '\n', '\r', ' ' });
                         display.vrr_enabled = mem.eql(u8, en_trimmed, "1");
@@ -274,14 +278,15 @@ pub const DisplayManager = struct {
     }
 
     fn parseDisplayMode(_: *DisplayManager, display: *Display, connector: []const u8) !void {
+        const io = Io.Threaded.global_single_threaded.io();
         var path_buf: [256]u8 = undefined;
         const modes_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/modes", .{connector}) catch return;
 
-        const file = fs.cwd().openFile(modes_path, .{}) catch return;
-        defer file.close();
+        const file = Dir.cwd().openFile(io, modes_path, .{}) catch return;
+        defer file.close(io);
 
         var modes_buf: [1024]u8 = undefined;
-        const modes_len = file.read(&modes_buf) catch return;
+        const modes_len = posix.read(file.handle, &modes_buf) catch return;
         const modes = modes_buf[0..modes_len];
 
         var lines = mem.splitSequence(u8, modes, "\n");
@@ -322,17 +327,19 @@ pub const DisplayManager = struct {
 
 /// Check if NVIDIA GPU is present
 pub fn isNvidiaGpu() bool {
-    fs.cwd().access("/proc/driver/nvidia/version", .{}) catch return false;
+    const io = Io.Threaded.global_single_threaded.io();
+    Dir.cwd().access(io, "/proc/driver/nvidia/version", .{}) catch return false;
     return true;
 }
 
 /// Get NVIDIA driver version
 pub fn getNvidiaDriverVersion(allocator: mem.Allocator) ?[]const u8 {
-    const file = fs.cwd().openFile("/proc/driver/nvidia/version", .{}) catch return null;
-    defer file.close();
+    const io = Io.Threaded.global_single_threaded.io();
+    const file = Dir.cwd().openFile(io, "/proc/driver/nvidia/version", .{}) catch return null;
+    defer file.close(io);
 
     var buf: [512]u8 = undefined;
-    const len = file.read(&buf) catch return null;
+    const len = posix.read(file.handle, &buf) catch return null;
     const content = buf[0..len];
 
     // Find version number pattern (e.g., "590.48.01")
@@ -427,7 +434,8 @@ pub fn getSystemStatus(allocator: mem.Allocator) !SystemStatus {
 
 /// Detect current compositor (legacy method)
 fn detectCompositorLegacy(allocator: mem.Allocator) ?[]const u8 {
-    if (posix.getenv("XDG_CURRENT_DESKTOP")) |desktop| {
+    if (std.c.getenv("XDG_CURRENT_DESKTOP")) |desktop_ptr| {
+        const desktop = mem.sliceTo(desktop_ptr, 0);
         if (mem.indexOf(u8, desktop, "KDE") != null) {
             return allocator.dupe(u8, "KWin") catch null;
         } else if (mem.indexOf(u8, desktop, "GNOME") != null) {
@@ -439,11 +447,11 @@ fn detectCompositorLegacy(allocator: mem.Allocator) ?[]const u8 {
         }
     }
 
-    if (posix.getenv("WAYLAND_DISPLAY") != null) {
+    if (std.c.getenv("WAYLAND_DISPLAY") != null) {
         return allocator.dupe(u8, "Wayland (unknown)") catch null;
     }
 
-    if (posix.getenv("DISPLAY") != null) {
+    if (std.c.getenv("DISPLAY") != null) {
         return allocator.dupe(u8, "X11") catch null;
     }
 

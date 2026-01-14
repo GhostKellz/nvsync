@@ -7,6 +7,8 @@ const std = @import("std");
 const posix = std.posix;
 const fs = std.fs;
 const mem = std.mem;
+const Io = std.Io;
+const process = std.process;
 
 /// Wayland compositor type
 pub const CompositorType = enum {
@@ -87,15 +89,16 @@ pub const CompositorType = enum {
 /// Detect current Wayland compositor
 pub fn detectCompositor() CompositorType {
     // Check environment variables
-    if (posix.getenv("HYPRLAND_INSTANCE_SIGNATURE") != null) {
+    if (std.c.getenv("HYPRLAND_INSTANCE_SIGNATURE") != null) {
         return .hyprland;
     }
 
-    if (posix.getenv("SWAYSOCK") != null) {
+    if (std.c.getenv("SWAYSOCK") != null) {
         return .sway;
     }
 
-    if (posix.getenv("XDG_CURRENT_DESKTOP")) |desktop| {
+    if (std.c.getenv("XDG_CURRENT_DESKTOP")) |desktop_ptr| {
+        const desktop = mem.sliceTo(desktop_ptr, 0);
         if (mem.indexOf(u8, desktop, "KDE") != null) {
             return .kwin;
         }
@@ -111,7 +114,7 @@ pub fn detectCompositor() CompositorType {
     }
 
     // Check for WAYLAND_DISPLAY
-    if (posix.getenv("WAYLAND_DISPLAY") != null) {
+    if (std.c.getenv("WAYLAND_DISPLAY") != null) {
         return .wlroots_other;
     }
 
@@ -120,21 +123,44 @@ pub fn detectCompositor() CompositorType {
 
 /// Check if running under Wayland
 pub fn isWayland() bool {
-    return posix.getenv("WAYLAND_DISPLAY") != null;
+    return std.c.getenv("WAYLAND_DISPLAY") != null;
 }
 
-/// KWin VRR control via D-Bus
+/// KWin VRR control via D-Bus with CLI fallback
 pub const KWinController = struct {
     allocator: mem.Allocator,
+    dbus_ctrl: ?dbus.KWinDBus,
+    use_dbus: bool,
+
+    const dbus = @import("dbus.zig");
 
     pub fn init(allocator: mem.Allocator) KWinController {
-        return .{ .allocator = allocator };
+        var dbus_ctrl = dbus.KWinDBus.init(allocator);
+        const use_dbus = dbus_ctrl.isAvailable();
+
+        return .{
+            .allocator = allocator,
+            .dbus_ctrl = if (use_dbus) dbus_ctrl else null,
+            .use_dbus = use_dbus,
+        };
     }
 
     /// Enable VRR on a specific output
     pub fn enableVrr(self: *KWinController, output: []const u8) !void {
-        _ = self;
-        // Use kscreen-doctor to enable VRR
+        // Try D-Bus first
+        if (self.use_dbus) {
+            if (self.dbus_ctrl) |*ctrl| {
+                // Parse output name to ID (simplified - assumes DP-1 -> 1)
+                const output_id = parseOutputId(output);
+                ctrl.setOutputVrr(output_id, true) catch {
+                    // Fall through to CLI
+                };
+                ctrl.reconfigure() catch {};
+                return;
+            }
+        }
+
+        // Fallback to kscreen-doctor CLI
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
@@ -142,22 +168,32 @@ pub const KWinController = struct {
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output.{s}.vrr.1", .{output}) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const io = Io.Threaded.global_single_threaded.io();
+        const result = process.run(allocator, io, .{
             .argv = &[_][]const u8{ "kscreen-doctor", cmd },
         }) catch return error.CommandFailed;
 
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
-        if (result.term.Exited != 0) {
+        if (result.term != .exited or result.term.exited != 0) {
             return error.SetVrrFailed;
         }
     }
 
     /// Disable VRR on a specific output
     pub fn disableVrr(self: *KWinController, output: []const u8) !void {
-        _ = self;
+        // Try D-Bus first
+        if (self.use_dbus) {
+            if (self.dbus_ctrl) |*ctrl| {
+                const output_id = parseOutputId(output);
+                ctrl.setOutputVrr(output_id, false) catch {};
+                ctrl.reconfigure() catch {};
+                return;
+            }
+        }
+
+        // Fallback to CLI
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
@@ -165,8 +201,8 @@ pub const KWinController = struct {
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output.{s}.vrr.0", .{output}) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const io = Io.Threaded.global_single_threaded.io();
+        const result = process.run(allocator, io, .{
             .argv = &[_][]const u8{ "kscreen-doctor", cmd },
         }) catch return error.CommandFailed;
 
@@ -176,19 +212,62 @@ pub const KWinController = struct {
 
     /// Query current VRR status
     pub fn queryVrrStatus(self: *KWinController) ![]const u8 {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        // Try D-Bus first
+        if (self.use_dbus) {
+            if (self.dbus_ctrl) |*ctrl| {
+                return ctrl.getOutputs() catch {
+                    // Fall through to CLI
+                    return self.queryVrrStatusCli();
+                };
+            }
+        }
+
+        return self.queryVrrStatusCli();
+    }
+
+    fn queryVrrStatusCli(self: *KWinController) ![]const u8 {
+        const io = Io.Threaded.global_single_threaded.io();
+        const result = process.run(self.allocator, io, .{
             .argv = &[_][]const u8{ "kscreen-doctor", "-o" },
         }) catch return error.CommandFailed;
 
         defer self.allocator.free(result.stderr);
 
-        if (result.term.Exited != 0) {
+        if (result.term != .exited or result.term.exited != 0) {
             self.allocator.free(result.stdout);
             return error.QueryFailed;
         }
 
         return result.stdout;
+    }
+
+    /// Get VRR status for a specific output
+    pub fn getVrrEnabled(self: *KWinController, output: []const u8) !bool {
+        if (self.use_dbus) {
+            if (self.dbus_ctrl) |*ctrl| {
+                const output_id = parseOutputId(output);
+                return ctrl.getOutputVrrStatus(output_id);
+            }
+        }
+        // CLI doesn't have a good way to query specific output
+        return false;
+    }
+
+    /// Check if using D-Bus backend
+    pub fn isUsingDBus(self: *const KWinController) bool {
+        return self.use_dbus;
+    }
+
+    /// Parse output name to ID (e.g., "DP-1" -> 1)
+    fn parseOutputId(output: []const u8) u32 {
+        // Find last hyphen and parse number after it
+        var i = output.len;
+        while (i > 0) : (i -= 1) {
+            if (output[i - 1] == '-') {
+                return std.fmt.parseInt(u32, output[i..], 10) catch 0;
+            }
+        }
+        return 0;
     }
 };
 
@@ -263,8 +342,7 @@ pub const HyprlandController = struct {
         var cmd_buf: [64]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "misc:vrr {d}", .{@intFromEnum(mode)}) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "keyword", cmd },
         }) catch return error.CommandFailed;
 
@@ -287,8 +365,7 @@ pub const HyprlandController = struct {
         const vrr_val: u8 = if (enabled) 1 else 0;
         const cmd = std.fmt.bufPrint(&cmd_buf, "monitor {s},preferred,auto,1,vrr,{d}", .{ monitor_name, vrr_val }) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "keyword", cmd },
         }) catch return error.CommandFailed;
 
@@ -303,8 +380,7 @@ pub const HyprlandController = struct {
 
     /// Query monitors (returns raw JSON)
     pub fn queryMonitors(self: *HyprlandController) ![]const u8 {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "monitors", "-j" },
         }) catch return error.CommandFailed;
 
@@ -315,8 +391,7 @@ pub const HyprlandController = struct {
 
     /// Query VRR status (misc settings)
     pub fn queryVrrStatus(self: *HyprlandController) !HyprlandVrrMode {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "getoption", "misc:vrr", "-j" },
         }) catch return error.CommandFailed;
 
@@ -335,8 +410,7 @@ pub const HyprlandController = struct {
 
     /// Get frame timing statistics from Hyprland
     pub fn getFrameStats(self: *HyprlandController) !HyprlandFrameStats {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "rollinglog", "-j" },
         }) catch return error.CommandFailed;
 
@@ -355,8 +429,7 @@ pub const HyprlandController = struct {
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "dispatch", command },
         }) catch return error.CommandFailed;
 
@@ -366,8 +439,7 @@ pub const HyprlandController = struct {
 
     /// Get active window info for VRR decisions
     pub fn getActiveWindow(self: *HyprlandController) !?HyprlandWindow {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "activewindow", "-j" },
         }) catch return error.CommandFailed;
 
@@ -445,8 +517,7 @@ pub const SwayController = struct {
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output {s} adaptive_sync on", .{output}) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "swaymsg", cmd },
         }) catch return error.CommandFailed;
 
@@ -464,8 +535,7 @@ pub const SwayController = struct {
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output {s} adaptive_sync off", .{output}) catch return error.BufferError;
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "swaymsg", cmd },
         }) catch return error.CommandFailed;
 
@@ -475,8 +545,7 @@ pub const SwayController = struct {
 
     /// Query outputs
     pub fn queryOutputs(self: *SwayController) ![]const u8 {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "swaymsg", "-t", "get_outputs" },
         }) catch return error.CommandFailed;
 
@@ -501,8 +570,7 @@ pub const MutterController = struct {
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{
                 "gsettings",
                 "set",
@@ -515,7 +583,7 @@ pub const MutterController = struct {
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
-        if (result.term.Exited != 0) {
+        if (result.term.exited != 0) {
             return error.SetVrrFailed;
         }
     }
@@ -527,8 +595,7 @@ pub const MutterController = struct {
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
 
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{
                 "gsettings",
                 "set",
@@ -544,8 +611,7 @@ pub const MutterController = struct {
 
     /// Check if VRR is enabled
     pub fn isVrrEnabled(self: *MutterController) !bool {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{
                 "gsettings",
                 "get",

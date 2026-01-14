@@ -1,5 +1,7 @@
 # nvsync
 
+> **⚠️ Experimental Project** - This project is under active development and not fully tested. Use at your own risk.
+
 **NVIDIA VRR & G-Sync Manager for Linux**
 
 A comprehensive Variable Refresh Rate management tool that provides proper G-Sync, G-Sync Compatible, and VRR support for Linux gaming with full Wayland and X11 support.

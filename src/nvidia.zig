@@ -7,6 +7,8 @@ const std = @import("std");
 const posix = std.posix;
 const fs = std.fs;
 const mem = std.mem;
+const Io = std.Io;
+const process = std.process;
 
 /// NVIDIA VRR mode
 pub const NvidiaVrrMode = enum {
@@ -170,8 +172,8 @@ pub fn getDriverVersion(allocator: mem.Allocator) ?[]const u8 {
 
 /// Query nvidia-settings attribute
 pub fn queryNvidiaSetting(allocator: mem.Allocator, attribute: []const u8) !?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const io = Io.Threaded.global_single_threaded.io();
+    const result = process.run(allocator, io, .{
         .argv = &[_][]const u8{
             "nvidia-settings",
             "-q",
@@ -183,7 +185,7 @@ pub fn queryNvidiaSetting(allocator: mem.Allocator, attribute: []const u8) !?[]c
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0) return null;
+    if (result.term.exited != 0) return null;
 
     const trimmed = mem.trim(u8, result.stdout, "\n \t\r");
     if (trimmed.len == 0) return null;
@@ -227,8 +229,8 @@ pub fn queryNvidiaDisplayAttribute(allocator: mem.Allocator, display: []const u8
     var query_buf: [256]u8 = undefined;
     const query = std.fmt.bufPrint(&query_buf, "[dpy:{s}]/{s}", .{ display, attribute }) catch return null;
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const io = Io.Threaded.global_single_threaded.io();
+    const result = process.run(allocator, io, .{
         .argv = &[_][]const u8{
             "nvidia-settings",
             "-q",
@@ -240,7 +242,7 @@ pub fn queryNvidiaDisplayAttribute(allocator: mem.Allocator, display: []const u8
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0) return null;
+    if (result.term.exited != 0) return null;
 
     const trimmed = mem.trim(u8, result.stdout, "\n \t\r");
     if (trimmed.len == 0) return null;
@@ -265,8 +267,8 @@ fn setMetaMode(metamode: []const u8) !void {
     var assign_buf: [512]u8 = undefined;
     const assign = std.fmt.bufPrint(&assign_buf, "CurrentMetaMode=\"nvidia-auto-select {{{s}}}\"", .{metamode}) catch return error.BufferError;
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const io = Io.Threaded.global_single_threaded.io();
+    const result = process.run(allocator, io, .{
         .argv = &[_][]const u8{
             "nvidia-settings",
             "--assign",
@@ -277,7 +279,7 @@ fn setMetaMode(metamode: []const u8) !void {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0) {
+    if (result.term.exited != 0) {
         return error.SetModeFailed;
     }
 }
@@ -300,8 +302,8 @@ pub fn setFrameLimit(fps: u32) !void {
 
     // Also can use nvidia-settings for some properties
     if (fps > 0) {
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const io = Io.Threaded.global_single_threaded.io();
+        const result = process.run(allocator, io, .{
             .argv = &[_][]const u8{
                 "nvidia-settings",
                 "--assign",

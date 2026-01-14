@@ -7,14 +7,22 @@ const nvsync = @import("nvsync");
 const posix = std.posix;
 const fs = std.fs;
 const mem = std.mem;
+const process = std.process;
 
-pub fn main() !void {
+pub fn main(init: process.Init.Minimal) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Collect args into an ArrayList
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(allocator);
+
+    var args_iter = process.Args.Iterator.init(init.args);
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, arg);
+    }
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
