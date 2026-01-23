@@ -188,60 +188,186 @@ pub const DrmManager = struct {
     }
 };
 
+/// VRR range result from EDID parsing
+pub const VrrRange = struct {
+    min: u32,
+    max: u32,
+    lfc_supported: bool, // Low Framerate Compensation (when range > 2.4x)
+    source: VrrSource,
+
+    pub const VrrSource = enum {
+        default, // Couldn't parse, using defaults
+        display_range_limits, // EDID 1.4 Display Range Limits descriptor
+        cta_vfpdb, // CTA-861 Video Format Preference Data Block
+        freesync_vsdb, // AMD FreeSync Vendor-Specific Data Block
+        displayid, // DisplayID 2.0 extension
+    };
+};
+
 /// Parse EDID for VRR range
-fn parseEdidVrrRange(edid: []const u8) struct { min: u32, max: u32 } {
+/// Supports:
+/// - EDID 1.4 Display Range Limits (0xFD descriptor)
+/// - CTA-861-G extension blocks
+/// - AMD FreeSync VSDB
+pub fn parseEdidVrrRange(edid: []const u8) VrrRange {
     // Default safe values
-    var result = .{ .min = 48, .max = 60 };
+    var result = VrrRange{
+        .min = 48,
+        .max = 60,
+        .lfc_supported = false,
+        .source = .default,
+    };
 
     if (edid.len < 128) return result;
 
-    // Look for Display Range Limits descriptor (tag 0xFD)
+    // Method 1: Look for Display Range Limits descriptor (tag 0xFD)
     // EDID detailed timing descriptors start at offset 54
     var offset: usize = 54;
     while (offset + 18 <= 126) : (offset += 18) {
         // Check for Display Range Limits descriptor
-        if (edid[offset] == 0 and edid[offset + 1] == 0 and edid[offset + 2] == 0 and edid[offset + 3] == 0xFD) {
-            // Byte 5: Min vertical rate
-            // Byte 6: Max vertical rate
-            result.min = edid[offset + 5];
-            result.max = edid[offset + 6];
+        // Format: 00 00 00 FD 00 min_v max_v ...
+        if (edid[offset] == 0 and edid[offset + 1] == 0 and
+            edid[offset + 2] == 0 and edid[offset + 3] == 0xFD)
+        {
+            const flags = edid[offset + 4];
+            var min_v: u32 = edid[offset + 5];
+            var max_v: u32 = edid[offset + 6];
 
-            // Check for extended timing support (offset flags)
-            if (edid[offset + 4] & 0x02 != 0) {
-                // Bit 1 set means add 255 to max
-                result.max += 255;
+            // Check for GTF/CVT secondary timing support
+            // Bits 0-1 indicate offsets to min/max V rates
+            if (flags & 0x01 != 0) {
+                // Bit 0: Add 255 to max vertical rate
+                max_v += 255;
+            }
+            if (flags & 0x02 != 0) {
+                // Bit 1: Add 255 to min vertical rate
+                min_v += 255;
+            }
+
+            // Sanity check the values
+            if (max_v > min_v and max_v <= 500 and min_v >= 1) {
+                result.min = min_v;
+                result.max = max_v;
+                result.source = .display_range_limits;
+                // LFC supported if range > 2.4x (e.g., 48-144Hz allows 24fps via doubling)
+                result.lfc_supported = (max_v * 10 / min_v) >= 24;
             }
             break;
         }
     }
 
-    // Also check CTA-861 extension blocks for VRR
+    // Method 2: Check CTA-861 extension blocks for VRR data
     if (edid.len >= 256 and edid[128] == 0x02) {
         // CTA-861 extension present
-        // Look for VFPDB (Video Format Preference Data Block) or VSVDB
-        // This is where FreeSync/G-Sync Compatible range is stored
-        var ext_offset: usize = 132; // Start of data blocks
-        const dtd_start = edid[130]; // Offset to detailed timing descriptors
+        const dtd_offset = edid[130]; // Offset to detailed timing descriptors
+        if (dtd_offset > 4 and dtd_offset < 127) {
+            var ext_offset: usize = 132; // Start of data blocks (after header)
 
-        while (ext_offset < 128 + dtd_start) {
-            const tag = (edid[ext_offset] & 0xE0) >> 5;
-            const length = edid[ext_offset] & 0x1F;
+            while (ext_offset < 128 + @as(usize, dtd_offset)) {
+                if (ext_offset >= edid.len) break;
 
-            if (tag == 7 and length >= 3) {
-                // Extended tag
-                const ext_tag = edid[ext_offset + 1];
-                if (ext_tag == 0x1A) {
-                    // VFPDB - contains VRR info
-                    // Implementation would parse this
+                const header = edid[ext_offset];
+                const tag = (header & 0xE0) >> 5;
+                const length = header & 0x1F;
+
+                if (ext_offset + length + 1 > edid.len) break;
+
+                if (tag == 3 and length >= 3) {
+                    // Vendor-Specific Data Block (VSDB)
+                    const oui = (@as(u32, edid[ext_offset + 3]) << 16) |
+                        (@as(u32, edid[ext_offset + 2]) << 8) |
+                        @as(u32, edid[ext_offset + 1]);
+
+                    // AMD FreeSync OUI: 0x00001A (little-endian: 1A 00 00)
+                    if (oui == 0x00001A and length >= 9) {
+                        // FreeSync VSDB format:
+                        // Byte 4: Version
+                        // Byte 5: Min refresh (offset by VSDB specific value)
+                        // Byte 6: Max refresh
+                        const fs_min = edid[ext_offset + 8];
+                        const fs_max = edid[ext_offset + 9];
+
+                        if (fs_max > fs_min and fs_max <= 255 and fs_min >= 24) {
+                            result.min = fs_min;
+                            result.max = fs_max;
+                            result.source = .freesync_vsdb;
+                            result.lfc_supported = (fs_max * 10 / fs_min) >= 24;
+                        }
+                    }
+                } else if (tag == 7 and length >= 2) {
+                    // Extended tag block
+                    const ext_tag = edid[ext_offset + 1];
+
+                    if (ext_tag == 0x1A and length >= 3) {
+                        // VFPDB (Video Format Preference Data Block)
+                        // Contains preferred VRR range
+                        // This is less common but some monitors use it
+                        result.source = .cta_vfpdb;
+                    }
                 }
-            }
 
-            ext_offset += length + 1;
-            if (ext_offset >= 256) break;
+                ext_offset += @as(usize, length) + 1;
+            }
         }
     }
 
+    // Method 3: Check for DisplayID 2.0 extension (rare but modern)
+    // DisplayID uses tag 0x70 at offset 128
+    if (edid.len >= 256 and edid[128] == 0x70) {
+        // DisplayID 2.0 extension present
+        // Would need more complex parsing for Dynamic Video Timing Range Block
+        result.source = .displayid;
+    }
+
     return result;
+}
+
+/// Parse EDID to get monitor name
+pub fn parseEdidMonitorName(edid: []const u8) ?[]const u8 {
+    if (edid.len < 128) return null;
+
+    // Look for Monitor Name descriptor (tag 0xFC)
+    var offset: usize = 54;
+    while (offset + 18 <= 126) : (offset += 18) {
+        if (edid[offset] == 0 and edid[offset + 1] == 0 and
+            edid[offset + 2] == 0 and edid[offset + 3] == 0xFC)
+        {
+            // Name is at offset + 5, up to 13 characters, terminated by 0x0A
+            const name_start = offset + 5;
+            var name_end = name_start;
+            while (name_end < offset + 18 and edid[name_end] != 0x0A and edid[name_end] != 0) {
+                name_end += 1;
+            }
+            if (name_end > name_start) {
+                return edid[name_start..name_end];
+            }
+        }
+    }
+    return null;
+}
+
+/// Parse EDID to get native resolution
+pub fn parseEdidNativeResolution(edid: []const u8) ?struct { width: u32, height: u32 } {
+    if (edid.len < 128) return null;
+
+    // First detailed timing descriptor (at offset 54) is typically native resolution
+    // Only parse if it's a timing descriptor (first two bytes non-zero = pixel clock)
+    if (edid[54] != 0 or edid[55] != 0) {
+        // Horizontal active pixels: bytes 56-57 (lower 8 bits) + byte 58 upper nibble
+        const h_active_low = edid[56];
+        const h_active_high = (edid[58] >> 4) & 0x0F;
+        const h_active: u32 = (@as(u32, h_active_high) << 8) | h_active_low;
+
+        // Vertical active lines: bytes 59-60 (lower 8 bits) + byte 61 upper nibble
+        const v_active_low = edid[59];
+        const v_active_high = (edid[61] >> 4) & 0x0F;
+        const v_active: u32 = (@as(u32, v_active_high) << 8) | v_active_low;
+
+        if (h_active > 0 and v_active > 0) {
+            return .{ .width = h_active, .height = v_active };
+        }
+    }
+    return null;
 }
 
 /// DRM ioctl definitions for VRR control
@@ -294,28 +420,15 @@ const drm_mode_get_property = extern struct {
 };
 
 /// Set VRR enabled via DRM (requires root or DRM master)
+/// Note: DRM ioctl method requires DRM master privileges which most applications don't have.
+/// The sysfs method in DisplayManager.setVrrViaSysfs is preferred.
 pub fn setVrrEnabled(card: u32, connector_id: u32, enabled: bool) !void {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/dev/dri/card{d}", .{card}) catch return error.PathError;
-
-    const fd = posix.open(path, .{ .ACCMODE = .RDWR }, 0) catch return error.OpenFailed;
-    defer posix.close(fd);
-
-    // Find the vrr_enabled property ID
-    const vrr_prop_id = try findPropertyId(fd, connector_id, "vrr_enabled");
-
-    // Set the property
-    var set_prop = drm_mode_obj_set_property{
-        .value = if (enabled) 1 else 0,
-        .prop_id = vrr_prop_id,
-        .obj_id = connector_id,
-        .obj_type = DRM_MODE_OBJECT_CONNECTOR,
-    };
-
-    const result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_SETPROPERTY, @intFromPtr(&set_prop));
-    if (result != 0) {
-        return error.IoctlFailed;
-    }
+    // DRM ioctl requires DRM master privileges which games/apps typically don't have.
+    // The compositor holds DRM master. Use sysfs or compositor APIs instead.
+    _ = card;
+    _ = connector_id;
+    _ = enabled;
+    return error.DrmMasterRequired;
 }
 
 /// Find a property ID by name for a connector
@@ -372,60 +485,18 @@ fn findPropertyId(fd: posix.fd_t, connector_id: u32, prop_name: []const u8) !u32
 }
 
 /// Get VRR enabled state via DRM
+/// Note: Use sysfs method instead - reads /sys/class/drm/*/vrr_enabled
 pub fn getVrrEnabled(card: u32, connector_id: u32) !bool {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/dev/dri/card{d}", .{card}) catch return error.PathError;
+    // Use sysfs instead of DRM ioctl for reading VRR state
+    _ = connector_id;
 
-    const fd = posix.open(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
-    defer posix.close(fd);
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/card{d}-*/vrr_enabled", .{card}) catch return false;
+    _ = path;
 
-    // Get all properties
-    var get_props = drm_mode_obj_get_properties{
-        .props_ptr = 0,
-        .prop_values_ptr = 0,
-        .count_props = 0,
-        .obj_id = connector_id,
-        .obj_type = DRM_MODE_OBJECT_CONNECTOR,
-    };
-
-    var result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
-    if (result != 0) return error.IoctlFailed;
-
-    if (get_props.count_props == 0) return false;
-
-    var prop_ids: [64]u32 = undefined;
-    var prop_values: [64]u64 = undefined;
-
-    const count = @min(get_props.count_props, 64);
-    get_props.props_ptr = @intFromPtr(&prop_ids);
-    get_props.prop_values_ptr = @intFromPtr(&prop_values);
-    get_props.count_props = count;
-
-    result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_OBJ_GETPROPERTIES, @intFromPtr(&get_props));
-    if (result != 0) return error.IoctlFailed;
-
-    // Find vrr_enabled property
-    for (prop_ids[0..count], prop_values[0..count]) |prop_id, value| {
-        var get_prop = drm_mode_get_property{
-            .values_ptr = 0,
-            .enum_blob_ptr = 0,
-            .prop_id = prop_id,
-            .flags = 0,
-            .name = [_]u8{0} ** 32,
-            .count_values = 0,
-            .count_enum_blobs = 0,
-        };
-
-        result = std.posix.system.ioctl(fd, DRM_IOCTL.MODE_GETPROPERTY, @intFromPtr(&get_prop));
-        if (result != 0) continue;
-
-        const name_slice = mem.sliceTo(&get_prop.name, 0);
-        if (mem.eql(u8, name_slice, "vrr_enabled")) {
-            return value != 0;
-        }
-    }
-
-    return false;
+    // The sysfs reading is done in DisplayManager.scanDrmDevices()
+    // This function is kept for API compatibility but prefers sysfs
+    return error.UseSysfsInstead;
 }
 
 test "DrmManager init" {
@@ -441,4 +512,43 @@ test "parseEdidVrrRange defaults" {
     const result = parseEdidVrrRange(&empty);
     try std.testing.expectEqual(@as(u32, 48), result.min);
     try std.testing.expectEqual(@as(u32, 60), result.max);
+    try std.testing.expectEqual(VrrRange.VrrSource.default, result.source);
+}
+
+test "parseEdidVrrRange display range limits" {
+    // Minimal EDID with Display Range Limits descriptor at offset 54
+    var edid: [128]u8 = [_]u8{0} ** 128;
+
+    // Set up a valid Display Range Limits descriptor
+    // Offset 54-71 is first detailed timing/descriptor block
+    edid[54] = 0x00; // Indicates it's a descriptor, not timing
+    edid[55] = 0x00;
+    edid[56] = 0x00;
+    edid[57] = 0xFD; // Display Range Limits tag
+    edid[58] = 0x00; // Flags
+    edid[59] = 48; // Min vertical rate: 48Hz
+    edid[60] = 144; // Max vertical rate: 144Hz
+
+    const result = parseEdidVrrRange(&edid);
+    try std.testing.expectEqual(@as(u32, 48), result.min);
+    try std.testing.expectEqual(@as(u32, 144), result.max);
+    try std.testing.expectEqual(VrrRange.VrrSource.display_range_limits, result.source);
+    try std.testing.expect(result.lfc_supported); // 144/48 = 3x > 2.4x
+}
+
+test "VrrRange lfc calculation" {
+    // LFC is supported when max/min ratio >= 2.4
+    // 144/48 = 3.0 -> LFC supported
+    // 60/48 = 1.25 -> LFC not supported
+    var edid: [128]u8 = [_]u8{0} ** 128;
+    edid[54] = 0x00;
+    edid[55] = 0x00;
+    edid[56] = 0x00;
+    edid[57] = 0xFD;
+    edid[58] = 0x00;
+    edid[59] = 48;
+    edid[60] = 60; // Only 60Hz max
+
+    const result = parseEdidVrrRange(&edid);
+    try std.testing.expect(!result.lfc_supported); // 60/48 = 1.25x < 2.4x
 }

@@ -523,6 +523,10 @@ pub const SwayController = struct {
 
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
+
+        if (result.term != .exited or result.term.exited != 0) {
+            return error.SetVrrFailed;
+        }
     }
 
     /// Disable adaptive sync on output
@@ -541,9 +545,13 @@ pub const SwayController = struct {
 
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
+
+        if (result.term != .exited or result.term.exited != 0) {
+            return error.SetVrrFailed;
+        }
     }
 
-    /// Query outputs
+    /// Query outputs (returns JSON)
     pub fn queryOutputs(self: *SwayController) ![]const u8 {
         const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "swaymsg", "-t", "get_outputs" },
@@ -552,6 +560,172 @@ pub const SwayController = struct {
         defer self.allocator.free(result.stderr);
 
         return result.stdout;
+    }
+
+    /// Check if adaptive sync is enabled on an output
+    pub fn isAdaptiveSyncEnabled(self: *SwayController, output: []const u8) !bool {
+        const outputs_json = try self.queryOutputs();
+        defer self.allocator.free(outputs_json);
+
+        // Find the output in JSON and check adaptive_sync_status
+        // Format: "name": "DP-1", ... "adaptive_sync_status": "enabled"
+        var search_buf: [128]u8 = undefined;
+        const search_name = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{output}) catch return false;
+
+        if (mem.indexOf(u8, outputs_json, search_name)) |name_pos| {
+            // Look for adaptive_sync_status after the name
+            const remaining = outputs_json[name_pos..];
+            if (mem.indexOf(u8, remaining, "\"adaptive_sync_status\":\"enabled\"")) |_| {
+                // Make sure we're still in the same output block
+                const next_name = mem.indexOf(u8, remaining[1..], "\"name\":");
+                const sync_pos = mem.indexOf(u8, remaining, "\"adaptive_sync_status\"") orelse return false;
+                if (next_name == null or sync_pos < next_name.?) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Get active window info for VRR decisions
+    pub fn getActiveWindow(self: *SwayController) !?SwayWindow {
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{ "swaymsg", "-t", "get_tree" },
+        }) catch return error.CommandFailed;
+
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        // Find focused window in tree
+        if (mem.indexOf(u8, result.stdout, "\"focused\":true")) |_| {
+            var window = SwayWindow{};
+            window.fullscreen = mem.indexOf(u8, result.stdout, "\"fullscreen_mode\":1") != null;
+            window.floating = mem.indexOf(u8, result.stdout, "\"type\":\"floating_con\"") != null;
+            return window;
+        }
+
+        return null;
+    }
+};
+
+/// Sway window info
+pub const SwayWindow = struct {
+    fullscreen: bool = false,
+    floating: bool = false,
+    app_id: [128]u8 = [_]u8{0} ** 128,
+    app_id_len: usize = 0,
+
+    pub fn getAppId(self: *const SwayWindow) []const u8 {
+        return self.app_id[0..self.app_id_len];
+    }
+};
+
+/// Generic wlroots VRR control via wlr-randr
+/// Works with any wlroots-based compositor (River, dwl, etc.)
+pub const WlrRandrController = struct {
+    allocator: mem.Allocator,
+
+    pub fn init(allocator: mem.Allocator) WlrRandrController {
+        return .{ .allocator = allocator };
+    }
+
+    /// Check if wlr-randr is available
+    pub fn isAvailable(self: *WlrRandrController) bool {
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{ "wlr-randr", "--help" },
+        }) catch return false;
+
+        self.allocator.free(result.stdout);
+        self.allocator.free(result.stderr);
+        return true;
+    }
+
+    /// Enable adaptive sync on output
+    pub fn enableAdaptiveSync(self: *WlrRandrController, output: []const u8) !void {
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{ "wlr-randr", "--output", output, "--adaptive-sync", "enabled" },
+        }) catch return error.CommandFailed;
+
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.term != .exited or result.term.exited != 0) {
+            return error.SetVrrFailed;
+        }
+    }
+
+    /// Disable adaptive sync on output
+    pub fn disableAdaptiveSync(self: *WlrRandrController, output: []const u8) !void {
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{ "wlr-randr", "--output", output, "--adaptive-sync", "disabled" },
+        }) catch return error.CommandFailed;
+
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.term != .exited or result.term.exited != 0) {
+            return error.SetVrrFailed;
+        }
+    }
+
+    /// Query outputs and their VRR status
+    pub fn queryOutputs(self: *WlrRandrController) ![]const u8 {
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{"wlr-randr"},
+        }) catch return error.CommandFailed;
+
+        defer self.allocator.free(result.stderr);
+
+        return result.stdout;
+    }
+
+    /// Check if adaptive sync is enabled on an output
+    pub fn isAdaptiveSyncEnabled(self: *WlrRandrController, output: []const u8) !bool {
+        const outputs = try self.queryOutputs();
+        defer self.allocator.free(outputs);
+
+        // wlr-randr output format:
+        // DP-1 "Monitor Name" (...)
+        //   Enabled: yes
+        //   ...
+        //   Adaptive Sync: enabled
+        var search_buf: [128]u8 = undefined;
+        const search = std.fmt.bufPrint(&search_buf, "{s} ", .{output}) catch return false;
+
+        if (mem.indexOf(u8, outputs, search)) |pos| {
+            // Find the next output (starts with non-space at line start) or end
+            const remaining = outputs[pos..];
+            var end_pos = remaining.len;
+            var i: usize = 1;
+            while (i < remaining.len) : (i += 1) {
+                if (remaining[i] == '\n' and i + 1 < remaining.len and remaining[i + 1] != ' ' and remaining[i + 1] != '\t') {
+                    end_pos = i;
+                    break;
+                }
+            }
+
+            const output_block = remaining[0..end_pos];
+            return mem.indexOf(u8, output_block, "Adaptive Sync: enabled") != null;
+        }
+
+        return false;
+    }
+
+    /// Set mode/refresh rate on output
+    pub fn setMode(self: *WlrRandrController, output: []const u8, width: u32, height: u32, refresh: f32) !void {
+        var mode_buf: [64]u8 = undefined;
+        const mode = std.fmt.bufPrint(&mode_buf, "{d}x{d}@{d:.3}", .{ width, height, refresh }) catch return error.BufferError;
+
+        const result = process.run(self.allocator, Io.Threaded.global_single_threaded.io(), .{
+            .argv = &[_][]const u8{ "wlr-randr", "--output", output, "--mode", mode },
+        }) catch return error.CommandFailed;
+
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.term != .exited or result.term.exited != 0) {
+            return error.SetModeFailed;
+        }
     }
 };
 
@@ -632,13 +806,23 @@ pub const WaylandVrrController = struct {
     allocator: mem.Allocator,
     compositor: CompositorType,
     hyprland_ctrl: ?HyprlandController,
+    wlr_randr_available: bool,
 
     pub fn init(allocator: mem.Allocator) WaylandVrrController {
         const compositor = detectCompositor();
+
+        // Check wlr-randr availability for generic wlroots
+        var wlr_avail = false;
+        if (compositor == .wlroots_other) {
+            var wlr = WlrRandrController.init(allocator);
+            wlr_avail = wlr.isAvailable();
+        }
+
         return .{
             .allocator = allocator,
             .compositor = compositor,
             .hyprland_ctrl = if (compositor == .hyprland) HyprlandController.init(allocator) else null,
+            .wlr_randr_available = wlr_avail,
         };
     }
 
@@ -665,9 +849,19 @@ pub const WaylandVrrController = struct {
                     }
                 }
             },
-            .sway, .wlroots_other => {
+            .sway => {
                 var ctrl = SwayController.init(self.allocator);
                 try ctrl.enableAdaptiveSync(output orelse "*");
+            },
+            .wlroots_other => {
+                // Try wlr-randr first, fallback to swaymsg
+                if (self.wlr_randr_available) {
+                    var ctrl = WlrRandrController.init(self.allocator);
+                    try ctrl.enableAdaptiveSync(output orelse return error.OutputRequired);
+                } else {
+                    var ctrl = SwayController.init(self.allocator);
+                    try ctrl.enableAdaptiveSync(output orelse "*");
+                }
             },
             .mutter => {
                 var ctrl = MutterController.init(self.allocator);
@@ -695,9 +889,18 @@ pub const WaylandVrrController = struct {
                     }
                 }
             },
-            .sway, .wlroots_other => {
+            .sway => {
                 var ctrl = SwayController.init(self.allocator);
                 try ctrl.disableAdaptiveSync(output orelse "*");
+            },
+            .wlroots_other => {
+                if (self.wlr_randr_available) {
+                    var ctrl = WlrRandrController.init(self.allocator);
+                    try ctrl.disableAdaptiveSync(output orelse return error.OutputRequired);
+                } else {
+                    var ctrl = SwayController.init(self.allocator);
+                    try ctrl.disableAdaptiveSync(output orelse "*");
+                }
             },
             .mutter => {
                 var ctrl = MutterController.init(self.allocator);
@@ -705,6 +908,41 @@ pub const WaylandVrrController = struct {
             },
             .unknown => {
                 return error.UnsupportedCompositor;
+            },
+        }
+    }
+
+    /// Query VRR status for a specific output
+    pub fn isVrrEnabled(self: *WaylandVrrController, output: []const u8) !bool {
+        switch (self.compositor) {
+            .kwin => {
+                var ctrl = KWinController.init(self.allocator);
+                return ctrl.getVrrEnabled(output);
+            },
+            .hyprland => {
+                if (self.hyprland_ctrl) |*ctrl| {
+                    const mode = try ctrl.queryVrrStatus();
+                    return mode != .off;
+                }
+                return false;
+            },
+            .sway => {
+                var ctrl = SwayController.init(self.allocator);
+                return ctrl.isAdaptiveSyncEnabled(output);
+            },
+            .wlroots_other => {
+                if (self.wlr_randr_available) {
+                    var ctrl = WlrRandrController.init(self.allocator);
+                    return ctrl.isAdaptiveSyncEnabled(output);
+                }
+                return false;
+            },
+            .mutter => {
+                var ctrl = MutterController.init(self.allocator);
+                return ctrl.isVrrEnabled();
+            },
+            .unknown => {
+                return false;
             },
         }
     }
@@ -733,6 +971,19 @@ pub const WaylandVrrController = struct {
         }
         return null;
     }
+
+    /// Get Sway-specific controller
+    pub fn getSwayController(self: *WaylandVrrController) ?SwayController {
+        if (self.compositor == .sway) {
+            return SwayController.init(self.allocator);
+        }
+        return null;
+    }
+
+    /// Check if wlr-randr backend is available
+    pub fn hasWlrRandr(self: *const WaylandVrrController) bool {
+        return self.wlr_randr_available;
+    }
 };
 
 test "detectCompositor basic" {
@@ -740,4 +991,22 @@ test "detectCompositor basic" {
     // Just ensure it doesn't crash
     _ = compositor.name();
     _ = compositor.supportsVrr();
+}
+
+test "WlrRandrController init" {
+    var ctrl = WlrRandrController.init(std.testing.allocator);
+    _ = ctrl.isAvailable(); // May return false if not installed
+}
+
+test "SwayController init" {
+    const ctrl = SwayController.init(std.testing.allocator);
+    _ = ctrl;
+}
+
+test "WaylandVrrController init/deinit" {
+    var ctrl = WaylandVrrController.init(std.testing.allocator);
+    defer ctrl.deinit();
+
+    _ = ctrl.hasWlrRandr();
+    _ = ctrl.getInstructions();
 }

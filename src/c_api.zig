@@ -101,7 +101,7 @@ const Context = struct {
             .allocator = allocator,
             .display_manager = nvsync.DisplayManager.init(allocator),
             .vrr_controller = nvsync.VrrController.init(allocator),
-            .frame_limiter = nvsync.FrameLimiter.default(),
+            .frame_limiter = nvsync.FrameLimiter.disabled(),
             .last_error = null,
         };
 
@@ -372,6 +372,183 @@ export fn nvsync_get_vrr_range(ctx: nvsync_ctx_t, index: u32, out_buf: [*]u8, bu
     // Null terminate
     if (range_str.len < buf_len) {
         out_buf[range_str.len] = 0;
+    }
+
+    return .success;
+}
+
+// =============================================================================
+// New VRR Control Functions (v0.2.2)
+// =============================================================================
+
+/// Set VRR enabled/disabled on a specific display by name
+/// This is the primary hardware control API for nvprime
+export fn nvsync_set_vrr_enabled(ctx: nvsync_ctx_t, display_name: ?[*:0]const u8, enabled: bool) nvsync_result_t {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return .error_invalid_handle));
+
+    const name_slice: ?[]const u8 = if (display_name) |name| std.mem.span(name) else null;
+
+    if (name_slice) |name| {
+        context.display_manager.setVrrEnabled(name, enabled) catch |err| {
+            context.setError(@errorName(err));
+            return switch (err) {
+                error.DisplayNotFound => .error_display_not_found,
+                error.VrrNotSupported => .error_not_supported,
+                else => .error_unknown,
+            };
+        };
+    } else {
+        // Enable/disable on all displays
+        if (enabled) {
+            context.display_manager.enableVrrAll() catch |err| {
+                context.setError(@errorName(err));
+                return .error_unknown;
+            };
+        } else {
+            context.display_manager.disableVrrAll() catch |err| {
+                context.setError(@errorName(err));
+                return .error_unknown;
+            };
+        }
+    }
+
+    return .success;
+}
+
+/// Check if VRR is capable on a display
+export fn nvsync_is_vrr_capable(ctx: nvsync_ctx_t, index: u32) bool {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return false));
+    const display = context.display_manager.get(index) orelse return false;
+    return display.vrr_capable or display.gsync_capable or display.gsync_compatible;
+}
+
+/// Check if VRR is currently enabled on a display
+export fn nvsync_is_vrr_enabled_display(ctx: nvsync_ctx_t, index: u32) bool {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return false));
+    const display = context.display_manager.get(index) orelse return false;
+    return display.vrr_enabled;
+}
+
+/// Get available display modes count
+export fn nvsync_get_mode_count(ctx: nvsync_ctx_t, index: u32) c_int {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return -1));
+    const display = context.display_manager.get(index) orelse return -1;
+
+    const modes = context.display_manager.getAvailableModes(display.name) catch return -1;
+    return @intCast(modes.len);
+}
+
+/// Display mode structure for C
+pub const nvsync_mode_t = extern struct {
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    mode_string: [64]u8,
+};
+
+/// Get a specific display mode
+export fn nvsync_get_mode(ctx: nvsync_ctx_t, display_index: u32, mode_index: u32, out_mode: ?*nvsync_mode_t) nvsync_result_t {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return .error_invalid_handle));
+    const mode_ptr = out_mode orelse return .error_invalid_param;
+
+    const display = context.display_manager.get(display_index) orelse return .error_display_not_found;
+    const modes = context.display_manager.getAvailableModes(display.name) catch return .error_unknown;
+
+    if (mode_index >= modes.len) return .error_invalid_param;
+
+    const mode = modes[mode_index];
+    mode_ptr.width = mode.width;
+    mode_ptr.height = mode.height;
+    mode_ptr.refresh_hz = mode.refresh_hz;
+    @memcpy(&mode_ptr.mode_string, &mode.mode_string);
+
+    return .success;
+}
+
+/// Set display refresh rate
+export fn nvsync_set_refresh_rate(ctx: nvsync_ctx_t, display_name: [*:0]const u8, hz: u32) nvsync_result_t {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return .error_invalid_handle));
+    const name_slice = std.mem.span(display_name);
+
+    context.display_manager.setRefreshRate(name_slice, hz) catch |err| {
+        context.setError(@errorName(err));
+        return switch (err) {
+            error.DisplayNotFound => .error_display_not_found,
+            error.ModeChangeFailed => .error_unknown,
+            else => .error_unknown,
+        };
+    };
+
+    return .success;
+}
+
+// =============================================================================
+// Profile API for nvprime
+// =============================================================================
+
+/// Game profile structure for C
+pub const nvsync_profile_t = extern struct {
+    name: [64]u8,
+    executable: [64]u8,
+    vrr_mode: nvsync_vrr_mode_t,
+    frame_limit: u32,
+    force_gsync: bool,
+    lfc_enabled: bool,
+};
+
+/// Get profile for a game executable
+/// Returns success if found, error_not_found if no profile exists
+export fn nvsync_get_profile_for_process(executable: [*:0]const u8, out_profile: ?*nvsync_profile_t) nvsync_result_t {
+    const profile_ptr = out_profile orelse return .error_invalid_param;
+    const exe_slice = std.mem.span(executable);
+
+    const profile = nvsync.getProfileForProcess(std.heap.c_allocator, exe_slice) catch return .error_unknown;
+
+    if (profile) |p| {
+        // Copy name
+        const name_len = @min(p.name.len, 63);
+        @memcpy(profile_ptr.name[0..name_len], p.name[0..name_len]);
+        profile_ptr.name[name_len] = 0;
+
+        // Copy executable
+        const exe_len = @min(p.executable.len, 63);
+        @memcpy(profile_ptr.executable[0..exe_len], p.executable[0..exe_len]);
+        profile_ptr.executable[exe_len] = 0;
+
+        profile_ptr.vrr_mode = switch (p.vrr_mode) {
+            .off => .off,
+            .gsync => .gsync,
+            .gsync_compatible => .gsync_compatible,
+            .vrr => .vrr,
+            .unknown => .unknown,
+        };
+        profile_ptr.frame_limit = p.frame_limit;
+        profile_ptr.force_gsync = p.force_gsync;
+        profile_ptr.lfc_enabled = p.lfc_enabled;
+
+        return .success;
+    }
+
+    return .error_not_supported; // No profile found
+}
+
+/// Check if LFC is supported on a display
+export fn nvsync_is_lfc_supported(ctx: nvsync_ctx_t, index: u32) bool {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return false));
+    const display = context.display_manager.get(index) orelse return false;
+    return display.lfc_supported;
+}
+
+/// Get display min/max refresh rates
+export fn nvsync_get_refresh_range(ctx: nvsync_ctx_t, index: u32, out_min: ?*u32, out_max: ?*u32) nvsync_result_t {
+    const context: *Context = @ptrCast(@alignCast(ctx orelse return .error_invalid_handle));
+    const display = context.display_manager.get(index) orelse return .error_display_not_found;
+
+    if (out_min) |min_ptr| {
+        min_ptr.* = display.min_hz;
+    }
+    if (out_max) |max_ptr| {
+        max_ptr.* = display.max_hz;
     }
 
     return .success;

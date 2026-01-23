@@ -1,0 +1,29 @@
+post_install() {
+    echo "==> nvsync installed successfully!"
+    echo ""
+    echo "==> For non-root VRR control, add yourself to the video group:"
+    echo "      sudo usermod -aG video \$USER"
+    echo "    Then log out and back in."
+    echo ""
+    echo "==> Reload udev rules:"
+    echo "      sudo udevadm control --reload-rules"
+    echo "      sudo udevadm trigger"
+    echo ""
+    echo "==> Quick start:"
+    echo "      nvsync status    # Show VRR status"
+    echo "      nvsync displays  # List displays"
+    echo "      nvsync enable    # Enable VRR"
+    echo ""
+    echo "==> Optional: Enable auto-switching daemon:"
+    echo "      systemctl --user enable --now nvsync.service"
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    echo "==> nvsync removed."
+    echo "==> You may want to disable the daemon:"
+    echo "      systemctl --user disable nvsync.service"
+}

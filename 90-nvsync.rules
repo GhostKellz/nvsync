@@ -1,0 +1,21 @@
+# nvsync udev rules - VRR control without root
+#
+# These rules grant write access to VRR sysfs nodes for users in the 'video' group.
+# Install: sudo cp 90-nvsync.rules /etc/udev/rules.d/
+# Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Add yourself to the video group: sudo usermod -aG video $USER
+# Then log out and back in.
+
+# DRM VRR enable node (card*-*/vrr_enabled)
+SUBSYSTEM=="drm", KERNEL=="card*", ATTR{vrr_enabled}=="*", MODE="0664", GROUP="video"
+
+# DRM connector VRR status
+SUBSYSTEM=="drm", KERNEL=="card*-*", MODE="0664", GROUP="video"
+
+# GPU device nodes for DRM master access
+KERNEL=="card[0-9]*", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+KERNEL=="renderD[0-9]*", SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+
+# NVIDIA specific nodes
+KERNEL=="nvidia*", SUBSYSTEM=="nvidia", GROUP="video", MODE="0660"

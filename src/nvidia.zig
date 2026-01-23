@@ -130,16 +130,30 @@ pub const NvidiaController = struct {
 
     /// Enable G-Sync/G-Sync Compatible on a display
     pub fn enableGsync(self: *NvidiaController, display: []const u8, mode: NvidiaVrrMode) !void {
-        _ = self;
-        const metamode = try buildMetaMode(display, mode);
-        try setMetaMode(metamode);
+        try setMetaMode(self.allocator, display, mode);
     }
 
     /// Disable G-Sync on a display
     pub fn disableGsync(self: *NvidiaController, display: []const u8) !void {
-        _ = self;
-        const metamode = try buildMetaMode(display, .disabled);
-        try setMetaMode(metamode);
+        try setMetaMode(self.allocator, display, .disabled);
+    }
+
+    /// Query if G-Sync is enabled on a display
+    pub fn isGsyncEnabled(self: *NvidiaController, display: []const u8) bool {
+        // Check AllowGSYNC and AllowGSYNCCompatible via nvidia-settings
+        const gsync = queryNvidiaDisplayAttribute(self.allocator, display, "AllowGSYNC");
+        if (gsync) |v| {
+            defer self.allocator.free(v);
+            if (mem.eql(u8, mem.trim(u8, v, " \t\n\r"), "1")) return true;
+        }
+
+        const compat = queryNvidiaDisplayAttribute(self.allocator, display, "AllowGSYNCCompatible");
+        if (compat) |v| {
+            defer self.allocator.free(v);
+            if (mem.eql(u8, mem.trim(u8, v, " \t\n\r"), "1")) return true;
+        }
+
+        return false;
     }
 };
 
@@ -251,21 +265,24 @@ pub fn queryNvidiaDisplayAttribute(allocator: mem.Allocator, display: []const u8
 }
 
 /// Build MetaMode string for nvidia-settings
-fn buildMetaMode(display: []const u8, mode: NvidiaVrrMode) ![]const u8 {
-    _ = display;
-    // Format: "DP-0: nvidia-auto-select +0+0 {AllowGSYNCCompatible=On}"
-    // For now return the VRR options part
-    return mode.toMetaModeString();
+/// Format: "DP-0: nvidia-auto-select +0+0 {AllowGSYNCCompatible=On}"
+fn buildMetaMode(allocator: mem.Allocator, display: []const u8, mode: NvidiaVrrMode) ![]const u8 {
+    // Convert DRM-style connector names (DP-1) to nvidia-settings style (DP-0)
+    // nvidia-settings uses 0-indexed connectors
+    var display_name: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&display_name, "{s}", .{display}) catch display;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "CurrentMetaMode=\"{s}: nvidia-auto-select +0+0 {{{s}}}\"",
+        .{ name, mode.toMetaModeString() },
+    );
 }
 
 /// Set MetaMode via nvidia-settings
-fn setMetaMode(metamode: []const u8) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var assign_buf: [512]u8 = undefined;
-    const assign = std.fmt.bufPrint(&assign_buf, "CurrentMetaMode=\"nvidia-auto-select {{{s}}}\"", .{metamode}) catch return error.BufferError;
+fn setMetaMode(allocator: mem.Allocator, display: []const u8, mode: NvidiaVrrMode) !void {
+    const assign = try buildMetaMode(allocator, display, mode);
+    defer allocator.free(assign);
 
     const io = Io.Threaded.global_single_threaded.io();
     const result = process.run(allocator, io, .{
@@ -279,7 +296,15 @@ fn setMetaMode(metamode: []const u8) !void {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
+    // Check for errors in stderr
     if (result.term.exited != 0) {
+        return error.SetModeFailed;
+    }
+
+    // nvidia-settings returns 0 even on some errors, check stderr
+    if (mem.indexOf(u8, result.stderr, "ERROR") != null or
+        mem.indexOf(u8, result.stderr, "Invalid") != null)
+    {
         return error.SetModeFailed;
     }
 }

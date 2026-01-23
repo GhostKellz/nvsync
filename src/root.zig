@@ -20,12 +20,15 @@ pub const drm = @import("drm.zig");
 pub const nvidia = @import("nvidia.zig");
 pub const wayland = @import("wayland.zig");
 pub const dbus = @import("dbus.zig");
+pub const profiles = @import("profiles.zig");
+pub const daemon = @import("daemon.zig");
+pub const xrandr = @import("xrandr.zig");
 
 /// Library version
 pub const version = std.SemanticVersion{
     .major = 0,
     .minor = 2,
-    .patch = 1,
+    .patch = 2,
 };
 
 /// VRR Mode
@@ -218,7 +221,33 @@ pub const DisplayManager = struct {
                 .height = 1080,
             };
 
-            // Read VRR capable
+            // Read EDID for VRR range and resolution
+            const edid_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/edid", .{entry.name}) catch "";
+            if (edid_path.len > 0) {
+                const edid_file = Dir.cwd().openFile(io, edid_path, .{}) catch null;
+                if (edid_file) |f| {
+                    defer f.close(io);
+                    var edid_buf: [512]u8 = undefined;
+                    const edid_len = posix.read(f.handle, &edid_buf) catch 0;
+                    if (edid_len >= 128) {
+                        const edid = edid_buf[0..edid_len];
+
+                        // Parse VRR range from EDID
+                        const vrr_range = drm.parseEdidVrrRange(edid);
+                        display.min_hz = vrr_range.min;
+                        display.max_hz = vrr_range.max;
+                        display.lfc_supported = vrr_range.lfc_supported;
+
+                        // Parse native resolution from EDID
+                        if (drm.parseEdidNativeResolution(edid)) |res| {
+                            display.width = res.width;
+                            display.height = res.height;
+                        }
+                    }
+                }
+            }
+
+            // Read VRR capable from sysfs
             const vrr_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/vrr_capable", .{entry.name}) catch "";
             if (vrr_path.len > 0) {
                 const vrr_file = Dir.cwd().openFile(io, vrr_path, .{}) catch null;
@@ -230,8 +259,6 @@ pub const DisplayManager = struct {
                         const vrr_trimmed = mem.trim(u8, vrr_buf[0..vrr_len], &[_]u8{ '\n', '\r', ' ' });
                         display.vrr_capable = mem.eql(u8, vrr_trimmed, "1");
                         display.gsync_compatible = display.vrr_capable;
-                        // LFC typically supported if VRR range is >= 2.4x
-                        display.lfc_supported = display.vrr_capable;
                     }
                 }
             }
@@ -254,7 +281,7 @@ pub const DisplayManager = struct {
                 }
             }
 
-            // Parse resolution from modes
+            // Parse refresh rate from modes (fallback)
             try self.parseDisplayMode(&display, entry.name);
 
             self.displays.append(self.allocator, display) catch continue;
@@ -323,6 +350,289 @@ pub const DisplayManager = struct {
         // Would need to allocate - for now return all
         return self.displays.items;
     }
+
+    // =========================================================================
+    // VRR Control Methods
+    // =========================================================================
+
+    /// Enable VRR on a specific display by name (e.g., "DP-1", "HDMI-A-1")
+    /// This is the primary API for nvprime and other consumers
+    pub fn setVrrEnabled(self: *DisplayManager, display_name: []const u8, enabled: bool) !void {
+        // Find the display
+        const display = self.findByName(display_name) orelse return error.DisplayNotFound;
+
+        if (!display.vrr_capable and !display.gsync_compatible) {
+            return error.VrrNotSupported;
+        }
+
+        // Try sysfs method first (simplest, works on most systems)
+        if (self.setVrrViaSysfs(display.name, enabled)) {
+            // Update local state
+            for (self.displays.items) |*d| {
+                if (mem.eql(u8, d.name, display.name)) {
+                    d.vrr_enabled = enabled;
+                    d.current_mode = if (enabled)
+                        (if (d.gsync_capable) .gsync else .gsync_compatible)
+                    else
+                        .off;
+                    break;
+                }
+            }
+            return;
+        }
+
+        // Try DRM ioctl method (requires DRM master)
+        self.setVrrViaDrm(display.name, enabled) catch |err| {
+            // Fall back to compositor-specific methods
+            if (wayland.isWayland()) {
+                var ctrl = wayland.WaylandVrrController.init(self.allocator);
+                if (enabled) {
+                    try ctrl.enableVrr(display_name);
+                } else {
+                    try ctrl.disableVrr(display_name);
+                }
+                return;
+            }
+
+            // X11: Use nvidia-settings
+            if (isNvidiaGpu()) {
+                var nv_ctrl = nvidia.NvidiaController.init(self.allocator);
+                defer nv_ctrl.deinit();
+                if (enabled) {
+                    try nv_ctrl.enableGsync(display_name, .gsync_compatible);
+                } else {
+                    try nv_ctrl.disableGsync(display_name);
+                }
+                return;
+            }
+
+            return err;
+        };
+    }
+
+    /// Set VRR via sysfs (most portable method)
+    fn setVrrViaSysfs(self: *DisplayManager, connector: []const u8, enabled: bool) bool {
+        _ = self;
+        const io = Io.Threaded.global_single_threaded.io();
+        var path_buf: [256]u8 = undefined;
+
+        // Try direct path first (connector name from scan includes card prefix)
+        const direct_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/vrr_enabled", .{connector}) catch return false;
+
+        if (Dir.cwd().openFile(io, direct_path, .{ .mode = .write_only })) |file| {
+            defer file.close(io);
+            const value: []const u8 = if (enabled) "1\n" else "0\n";
+            file.writeStreamingAll(io, value) catch return false;
+            return true;
+        } else |_| {
+            // Try to find matching connector by suffix
+            if (mem.indexOf(u8, connector, "-")) |idx| {
+                const short_name = connector[idx + 1 ..];
+
+                var dir = Dir.cwd().openDir(io, "/sys/class/drm", .{ .iterate = true }) catch return false;
+                defer dir.close(io);
+
+                var iter = dir.iterate();
+                while (iter.next(io) catch null) |entry| {
+                    if (mem.endsWith(u8, entry.name, short_name)) {
+                        const full_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/vrr_enabled", .{entry.name}) catch continue;
+                        if (Dir.cwd().openFile(io, full_path, .{ .mode = .write_only })) |file| {
+                            defer file.close(io);
+                            const value: []const u8 = if (enabled) "1\n" else "0\n";
+                            file.writeStreamingAll(io, value) catch return false;
+                            return true;
+                        } else |_| {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Set VRR via DRM ioctl (requires DRM master)
+    fn setVrrViaDrm(self: *DisplayManager, connector: []const u8, enabled: bool) !void {
+        _ = self;
+        // Parse card number from connector name (e.g., "card1-DP-1" -> card 1)
+        const card_num = blk: {
+            if (mem.startsWith(u8, connector, "card")) {
+                const dash_idx = mem.indexOf(u8, connector, "-") orelse break :blk @as(u32, 0);
+                break :blk std.fmt.parseInt(u32, connector[4..dash_idx], 10) catch 0;
+            }
+            break :blk @as(u32, 0);
+        };
+
+        // Get connector ID (would need to enumerate via ioctl)
+        // For now, use sysfs to find it
+        var path_buf: [256]u8 = undefined;
+        const conn_id_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/connector_id", .{connector}) catch return error.PathError;
+
+        const io = Io.Threaded.global_single_threaded.io();
+        const file = Dir.cwd().openFile(io, conn_id_path, .{}) catch return error.ConnectorIdNotFound;
+        defer file.close(io);
+
+        var buf: [32]u8 = undefined;
+        const len = posix.read(file.handle, &buf) catch return error.ReadFailed;
+        const conn_id_str = mem.trim(u8, buf[0..len], &[_]u8{ '\n', '\r', ' ' });
+        const connector_id = std.fmt.parseInt(u32, conn_id_str, 10) catch return error.InvalidConnectorId;
+
+        try drm.setVrrEnabled(card_num, connector_id, enabled);
+    }
+
+    /// Enable VRR on all capable displays
+    pub fn enableVrrAll(self: *DisplayManager) !void {
+        var errors: usize = 0;
+        for (self.displays.items) |d| {
+            if (d.vrr_capable or d.gsync_compatible) {
+                self.setVrrEnabled(d.name, true) catch {
+                    errors += 1;
+                };
+            }
+        }
+        if (errors > 0 and errors == self.displays.items.len) {
+            return error.AllDisplaysFailed;
+        }
+    }
+
+    /// Disable VRR on all displays
+    pub fn disableVrrAll(self: *DisplayManager) !void {
+        for (self.displays.items) |d| {
+            if (d.vrr_enabled) {
+                self.setVrrEnabled(d.name, false) catch continue;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Display Mode / Refresh Rate Control
+    // =========================================================================
+
+    /// Display mode information
+    pub const DisplayMode = struct {
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        mode_string: [64]u8,
+        mode_len: usize,
+
+        pub fn getString(self: *const DisplayMode) []const u8 {
+            return self.mode_string[0..self.mode_len];
+        }
+    };
+
+    /// Get available display modes for a display
+    pub fn getAvailableModes(self: *DisplayManager, display_name: []const u8) ![]DisplayMode {
+        const display = self.findByName(display_name) orelse return error.DisplayNotFound;
+        _ = display;
+
+        var path_buf: [256]u8 = undefined;
+        const modes_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/modes", .{display_name}) catch return error.PathError;
+
+        const io = Io.Threaded.global_single_threaded.io();
+        const file = Dir.cwd().openFile(io, modes_path, .{}) catch return error.ModesNotFound;
+        defer file.close(io);
+
+        var modes_buf: [4096]u8 = undefined;
+        const modes_len = posix.read(file.handle, &modes_buf) catch return error.ReadFailed;
+        const modes_content = modes_buf[0..modes_len];
+
+        // Parse modes (format: "1920x1080" per line, Hz in separate file or parsed)
+        var modes = std.ArrayListUnmanaged(DisplayMode).empty;
+        var lines = mem.splitSequence(u8, modes_content, "\n");
+
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var mode = DisplayMode{
+                .width = 0,
+                .height = 0,
+                .refresh_hz = 60, // Default, would need modeline parsing for exact
+                .mode_string = [_]u8{0} ** 64,
+                .mode_len = @min(line.len, 63),
+            };
+
+            @memcpy(mode.mode_string[0..mode.mode_len], line[0..mode.mode_len]);
+
+            // Parse WxH format
+            var parts = mem.splitSequence(u8, line, "x");
+            if (parts.next()) |w| {
+                mode.width = std.fmt.parseInt(u32, w, 10) catch 0;
+            }
+            if (parts.next()) |h| {
+                mode.height = std.fmt.parseInt(u32, h, 10) catch 0;
+            }
+
+            if (mode.width > 0 and mode.height > 0) {
+                modes.append(self.allocator, mode) catch continue;
+            }
+        }
+
+        return modes.items;
+    }
+
+    /// Set display refresh rate (requires xrandr or wlr-randr)
+    pub fn setRefreshRate(self: *DisplayManager, display_name: []const u8, hz: u32) !void {
+        const display = self.findByName(display_name) orelse return error.DisplayNotFound;
+
+        // Build mode string for the current resolution
+        var mode_buf: [64]u8 = undefined;
+        const mode_str = std.fmt.bufPrint(&mode_buf, "{d}x{d}", .{ display.width, display.height }) catch return error.FormatError;
+
+        const io = Io.Threaded.global_single_threaded.io();
+
+        if (wayland.isWayland()) {
+            // Use wlr-randr for wlroots compositors, or compositor-specific tools
+            const result = std.process.run(self.allocator, io, .{
+                .argv = &[_][]const u8{
+                    "wlr-randr",
+                    "--output",
+                    display_name,
+                    "--mode",
+                    mode_str,
+                    "--custom-mode",
+                    std.fmt.bufPrint(&mode_buf, "{d}x{d}@{d}", .{ display.width, display.height, hz }) catch return error.FormatError,
+                },
+            }) catch return error.WlrRandrFailed;
+            defer self.allocator.free(result.stdout);
+            defer self.allocator.free(result.stderr);
+
+            if (result.term.exited != 0) {
+                return error.ModeChangeFailed;
+            }
+        } else {
+            // Use xrandr for X11
+            var rate_buf: [16]u8 = undefined;
+            const rate_str = std.fmt.bufPrint(&rate_buf, "{d}", .{hz}) catch return error.FormatError;
+
+            const result = std.process.run(self.allocator, io, .{
+                .argv = &[_][]const u8{
+                    "xrandr",
+                    "--output",
+                    display_name,
+                    "--mode",
+                    mode_str,
+                    "--rate",
+                    rate_str,
+                },
+            }) catch return error.XrandrFailed;
+            defer self.allocator.free(result.stdout);
+            defer self.allocator.free(result.stderr);
+
+            if (result.term.exited != 0) {
+                return error.ModeChangeFailed;
+            }
+        }
+
+        // Update local state
+        for (self.displays.items) |*d| {
+            if (mem.eql(u8, d.name, display.name)) {
+                d.current_hz = hz;
+                break;
+            }
+        }
+    }
 };
 
 /// Check if NVIDIA GPU is present
@@ -364,26 +674,159 @@ pub fn getNvidiaDriverVersion(allocator: mem.Allocator) ?[]const u8 {
     return null;
 }
 
-/// Frame limiter configuration
+/// Frame limiter with actual timing implementation
 pub const FrameLimiter = struct {
-    enabled: bool,
     target_fps: u32,
+    target_frame_time_ns: u64,
+    last_frame_instant: ?std.time.Instant,
     mode: LimitMode,
+    enabled: bool,
+
+    // Statistics
+    frame_count: u64,
+    total_sleep_ns: u64,
+    avg_frame_time_ns: u64,
 
     pub const LimitMode = enum {
-        /// GPU-based limiting (lowest latency)
+        /// GPU-based limiting via environment variables (lowest latency)
+        /// Uses __GL_MaxFramesAllowed
         gpu,
-        /// CPU-based limiting (fallback)
+        /// CPU-based limiting with sleep + busy-wait hybrid
         cpu,
-        /// Vulkan present wait
+        /// Vulkan present wait (requires VK_KHR_present_wait)
         present_wait,
     };
 
-    pub fn default() FrameLimiter {
+    /// Create a new frame limiter with target FPS
+    pub fn init(target_fps: u32, mode: LimitMode) FrameLimiter {
+        const frame_time: u64 = if (target_fps > 0) 1_000_000_000 / target_fps else 0;
         return .{
-            .enabled = false,
+            .target_fps = target_fps,
+            .target_frame_time_ns = frame_time,
+            .last_frame_instant = std.time.Instant.now() catch null,
+            .mode = mode,
+            .enabled = target_fps > 0,
+            .frame_count = 0,
+            .total_sleep_ns = 0,
+            .avg_frame_time_ns = frame_time,
+        };
+    }
+
+    /// Create disabled frame limiter
+    pub fn disabled() FrameLimiter {
+        return .{
             .target_fps = 0,
-            .mode = .gpu,
+            .target_frame_time_ns = 0,
+            .last_frame_instant = null,
+            .mode = .cpu,
+            .enabled = false,
+            .frame_count = 0,
+            .total_sleep_ns = 0,
+            .avg_frame_time_ns = 0,
+        };
+    }
+
+    /// Call at the start of each frame
+    pub fn beginFrame(self: *FrameLimiter) void {
+        self.last_frame_instant = std.time.Instant.now() catch null;
+    }
+
+    /// Call at the end of each frame - waits to maintain target FPS
+    /// Uses hybrid sleep + busy-wait for sub-millisecond precision
+    pub fn endFrame(self: *FrameLimiter) void {
+        if (!self.enabled or self.target_frame_time_ns == 0) return;
+        if (self.mode == .gpu) return; // GPU mode doesn't need CPU timing
+
+        const last_instant = self.last_frame_instant orelse return;
+        const now = std.time.Instant.now() catch return;
+
+        const elapsed = now.since(last_instant);
+        if (elapsed >= self.target_frame_time_ns) {
+            // Already over budget, no sleep needed
+            self.updateStats(elapsed, 0);
+            return;
+        }
+
+        const remaining = self.target_frame_time_ns - elapsed;
+
+        // Hybrid approach: sleep most of the time, busy-wait the last portion
+        // This balances CPU usage with timing precision
+        const busy_wait_threshold: u64 = 500_000; // 0.5ms
+
+        if (remaining > busy_wait_threshold + 1_000_000) {
+            // Sleep for most of the remaining time (leave 0.5ms + margin for busy-wait)
+            const sleep_time = remaining - busy_wait_threshold;
+            std.time.sleep(sleep_time);
+            self.total_sleep_ns += sleep_time;
+        }
+
+        // Busy-wait for the final portion (sub-millisecond precision)
+        while (true) {
+            const current = std.time.Instant.now() catch break;
+            const total_elapsed = current.since(last_instant);
+            if (total_elapsed >= self.target_frame_time_ns) break;
+
+            // Hint to CPU we're spin-waiting
+            std.atomic.spinLoopHint();
+        }
+
+        const final_now = std.time.Instant.now() catch return;
+        const final_elapsed = final_now.since(last_instant);
+        self.updateStats(final_elapsed, remaining);
+    }
+
+    fn updateStats(self: *FrameLimiter, frame_time_ns: u64, slept_ns: u64) void {
+        self.frame_count += 1;
+        self.total_sleep_ns += slept_ns;
+
+        // Exponential moving average for frame time
+        const alpha: u64 = 16; // 1/16 weight for new sample
+        self.avg_frame_time_ns = (self.avg_frame_time_ns * (alpha - 1) + frame_time_ns) / alpha;
+    }
+
+    /// Get current average FPS
+    pub fn getAverageFps(self: *const FrameLimiter) f32 {
+        if (self.avg_frame_time_ns == 0) return 0;
+        return @as(f32, 1_000_000_000.0) / @as(f32, @floatFromInt(self.avg_frame_time_ns));
+    }
+
+    /// Get target frame time in milliseconds
+    pub fn getTargetFrameTimeMs(self: *const FrameLimiter) f32 {
+        if (self.target_frame_time_ns == 0) return 0;
+        return @as(f32, @floatFromInt(self.target_frame_time_ns)) / 1_000_000.0;
+    }
+
+    /// Reset statistics
+    pub fn resetStats(self: *FrameLimiter) void {
+        self.frame_count = 0;
+        self.total_sleep_ns = 0;
+        self.avg_frame_time_ns = self.target_frame_time_ns;
+    }
+
+    /// Set new target FPS
+    pub fn setTargetFps(self: *FrameLimiter, fps: u32) void {
+        self.target_fps = fps;
+        self.target_frame_time_ns = if (fps > 0) 1_000_000_000 / fps else 0;
+        self.enabled = fps > 0;
+        self.resetStats();
+    }
+
+    /// Generate environment variables for GPU-based limiting
+    pub fn getGpuEnvVars(self: *const FrameLimiter) struct {
+        sync_to_vblank: []const u8,
+        max_frames: []const u8,
+    } {
+        if (self.target_fps == 0) {
+            return .{
+                .sync_to_vblank = "",
+                .max_frames = "",
+            };
+        }
+
+        // These are compile-time strings, caller should format target_fps
+        return .{
+            .sync_to_vblank = "0",
+            .max_frames = "set to target FPS",
         };
     }
 };
@@ -511,6 +954,145 @@ pub const VrrController = struct {
 };
 
 // =============================================================================
+// Simplified VRR API - Convenience functions for easy access
+// =============================================================================
+
+/// Enable VRR on a display (simplified API)
+/// This is the easiest way for consumers like nvprime to enable VRR
+pub fn enableVrr(allocator: mem.Allocator, display_name: ?[]const u8) !void {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+
+    if (display_name) |name| {
+        try manager.setVrrEnabled(name, true);
+    } else {
+        try manager.enableVrrAll();
+    }
+}
+
+/// Disable VRR on a display (simplified API)
+pub fn disableVrr(allocator: mem.Allocator, display_name: ?[]const u8) !void {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+
+    if (display_name) |name| {
+        try manager.setVrrEnabled(name, false);
+    } else {
+        try manager.disableVrrAll();
+    }
+}
+
+/// Check if VRR is currently enabled on a display
+pub fn isVrrEnabled(allocator: mem.Allocator, display_name: []const u8) !bool {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+
+    const display = manager.findByName(display_name) orelse return error.DisplayNotFound;
+    return display.vrr_enabled;
+}
+
+/// Check if a display is VRR-capable
+pub fn isVrrCapable(allocator: mem.Allocator, display_name: []const u8) !bool {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+
+    const display = manager.findByName(display_name) orelse return error.DisplayNotFound;
+    return display.vrr_capable or display.gsync_capable or display.gsync_compatible;
+}
+
+/// Get VRR range for a display
+pub fn getVrrRange(allocator: mem.Allocator, display_name: []const u8) !struct { min: u32, max: u32, lfc: bool } {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+
+    const display = manager.findByName(display_name) orelse return error.DisplayNotFound;
+    return .{
+        .min = display.min_hz,
+        .max = display.max_hz,
+        .lfc = display.lfc_supported,
+    };
+}
+
+/// Set display refresh rate (simplified API)
+pub fn setRefreshRate(allocator: mem.Allocator, display_name: []const u8, hz: u32) !void {
+    var manager = DisplayManager.init(allocator);
+    defer manager.deinit();
+    try manager.scan();
+    try manager.setRefreshRate(display_name, hz);
+}
+
+// =============================================================================
+// Profile Lookup API - For nvprime integration
+// =============================================================================
+
+/// Game profile settings returned from lookup
+pub const ProfileSettings = struct {
+    name: []const u8,
+    executable: []const u8,
+    vrr_mode: VrrMode,
+    frame_limit: u32,
+    force_gsync: bool,
+    lfc_enabled: bool,
+};
+
+/// Get profile settings for a game executable
+/// This is the primary API for nvprime to auto-apply settings on game launch
+pub fn getProfileForProcess(allocator: mem.Allocator, executable: []const u8) !?ProfileSettings {
+    var manager = profiles.ProfileManager.init(allocator);
+    defer manager.deinit();
+
+    manager.load() catch return null;
+
+    if (manager.getForProcess(executable)) |profile| {
+        return ProfileSettings{
+            .name = profile.name,
+            .executable = profile.executable,
+            .vrr_mode = profile.vrr_mode,
+            .frame_limit = profile.frame_limit,
+            .force_gsync = profile.force_gsync,
+            .lfc_enabled = profile.lfc_enabled,
+        };
+    }
+
+    return null;
+}
+
+/// Apply a game profile (enable VRR and set frame limit)
+pub fn applyProfile(allocator: mem.Allocator, executable: []const u8) !void {
+    const profile = try getProfileForProcess(allocator, executable) orelse return error.ProfileNotFound;
+
+    // Apply VRR settings if not off
+    if (profile.vrr_mode != .off) {
+        enableVrr(allocator, null) catch {}; // Best effort
+    }
+
+    // Frame limit is applied via environment variables for GPU limiting
+    // The caller (nvprime) can use profile.frame_limit to set __GL_MaxFramesAllowed
+}
+
+/// List all available profiles
+pub fn listProfiles(allocator: mem.Allocator) ![]profiles.GameProfile {
+    var manager = profiles.ProfileManager.init(allocator);
+    defer manager.deinit();
+
+    manager.load() catch return &[_]profiles.GameProfile{};
+
+    // Copy profiles to return
+    var result = std.ArrayListUnmanaged(profiles.GameProfile).empty;
+    var iter = manager.list();
+    while (iter.next()) |entry| {
+        result.append(allocator, entry.value_ptr.*) catch continue;
+    }
+
+    return result.items;
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -533,4 +1115,40 @@ test "ConnectionType VRR support" {
     try std.testing.expect(ConnectionType.displayport.supportsVrr());
     try std.testing.expect(ConnectionType.hdmi.supportsVrr());
     try std.testing.expect(!ConnectionType.vga.supportsVrr());
+}
+
+test "FrameLimiter init" {
+    var limiter = FrameLimiter.init(144, .cpu);
+    try std.testing.expectEqual(@as(u32, 144), limiter.target_fps);
+    try std.testing.expect(limiter.enabled);
+
+    // Target frame time for 144 FPS should be ~6.94ms (6944444 ns)
+    const expected_ns: u64 = 1_000_000_000 / 144;
+    try std.testing.expectEqual(expected_ns, limiter.target_frame_time_ns);
+}
+
+test "FrameLimiter disabled" {
+    const limiter = FrameLimiter.disabled();
+    try std.testing.expectEqual(@as(u32, 0), limiter.target_fps);
+    try std.testing.expect(!limiter.enabled);
+}
+
+test "FrameLimiter setTargetFps" {
+    var limiter = FrameLimiter.init(60, .cpu);
+    try std.testing.expectEqual(@as(u32, 60), limiter.target_fps);
+
+    limiter.setTargetFps(144);
+    try std.testing.expectEqual(@as(u32, 144), limiter.target_fps);
+    try std.testing.expect(limiter.enabled);
+
+    limiter.setTargetFps(0);
+    try std.testing.expectEqual(@as(u32, 0), limiter.target_fps);
+    try std.testing.expect(!limiter.enabled);
+}
+
+test "FrameLimiter getTargetFrameTimeMs" {
+    const limiter = FrameLimiter.init(60, .cpu);
+    const frame_time_ms = limiter.getTargetFrameTimeMs();
+    // 60 FPS = 16.67ms per frame
+    try std.testing.expect(frame_time_ms > 16.0 and frame_time_ms < 17.0);
 }
