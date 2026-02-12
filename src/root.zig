@@ -674,11 +674,47 @@ pub fn getNvidiaDriverVersion(allocator: mem.Allocator) ?[]const u8 {
     return null;
 }
 
+/// Monotonic time instant for high-precision timing
+/// Replaces std.time.Instant which was removed in Zig 0.16
+pub const Instant = struct {
+    timestamp: i128,
+
+    pub fn now() error{Unsupported}!Instant {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) {
+            return error.Unsupported;
+        }
+        return .{
+            .timestamp = @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec,
+        };
+    }
+
+    pub fn since(self: Instant, earlier: Instant) u64 {
+        const diff = self.timestamp - earlier.timestamp;
+        return if (diff < 0) 0 else @intCast(diff);
+    }
+};
+
+/// Sleep for the specified number of nanoseconds
+fn nanosleep(ns: u64) void {
+    var req: std.c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (true) {
+        const rc = std.c.nanosleep(&req, &req);
+        if (rc == 0) return;
+        const err = std.posix.errno(rc);
+        if (err != .INTR) return;
+        // Interrupted by signal, continue sleeping
+    }
+}
+
 /// Frame limiter with actual timing implementation
 pub const FrameLimiter = struct {
     target_fps: u32,
     target_frame_time_ns: u64,
-    last_frame_instant: ?std.time.Instant,
+    last_frame_instant: ?Instant,
     mode: LimitMode,
     enabled: bool,
 
@@ -703,7 +739,7 @@ pub const FrameLimiter = struct {
         return .{
             .target_fps = target_fps,
             .target_frame_time_ns = frame_time,
-            .last_frame_instant = std.time.Instant.now() catch null,
+            .last_frame_instant = Instant.now() catch null,
             .mode = mode,
             .enabled = target_fps > 0,
             .frame_count = 0,
@@ -728,7 +764,7 @@ pub const FrameLimiter = struct {
 
     /// Call at the start of each frame
     pub fn beginFrame(self: *FrameLimiter) void {
-        self.last_frame_instant = std.time.Instant.now() catch null;
+        self.last_frame_instant = Instant.now() catch null;
     }
 
     /// Call at the end of each frame - waits to maintain target FPS
@@ -738,7 +774,7 @@ pub const FrameLimiter = struct {
         if (self.mode == .gpu) return; // GPU mode doesn't need CPU timing
 
         const last_instant = self.last_frame_instant orelse return;
-        const now = std.time.Instant.now() catch return;
+        const now = Instant.now() catch return;
 
         const elapsed = now.since(last_instant);
         if (elapsed >= self.target_frame_time_ns) {
@@ -756,13 +792,13 @@ pub const FrameLimiter = struct {
         if (remaining > busy_wait_threshold + 1_000_000) {
             // Sleep for most of the remaining time (leave 0.5ms + margin for busy-wait)
             const sleep_time = remaining - busy_wait_threshold;
-            std.time.sleep(sleep_time);
+            nanosleep(sleep_time);
             self.total_sleep_ns += sleep_time;
         }
 
         // Busy-wait for the final portion (sub-millisecond precision)
         while (true) {
-            const current = std.time.Instant.now() catch break;
+            const current = Instant.now() catch break;
             const total_elapsed = current.since(last_instant);
             if (total_elapsed >= self.target_frame_time_ns) break;
 
@@ -770,7 +806,7 @@ pub const FrameLimiter = struct {
             std.atomic.spinLoopHint();
         }
 
-        const final_now = std.time.Instant.now() catch return;
+        const final_now = Instant.now() catch return;
         const final_elapsed = final_now.since(last_instant);
         self.updateStats(final_elapsed, remaining);
     }
