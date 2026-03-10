@@ -28,7 +28,7 @@ pub const xrandr = @import("xrandr.zig");
 pub const version = std.SemanticVersion{
     .major = 0,
     .minor = 2,
-    .patch = 2,
+    .patch = 4,
 };
 
 /// VRR Mode
