@@ -161,9 +161,9 @@ pub const KWinController = struct {
         }
 
         // Fallback to kscreen-doctor CLI
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output.{s}.vrr.1", .{output}) catch return error.BufferError;
@@ -194,9 +194,9 @@ pub const KWinController = struct {
         }
 
         // Fallback to CLI
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output.{s}.vrr.0", .{output}) catch return error.BufferError;
@@ -335,9 +335,9 @@ pub const HyprlandController = struct {
     /// Enable VRR globally
     pub fn enableVrr(self: *HyprlandController, mode: HyprlandVrrMode) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         var cmd_buf: [64]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "misc:vrr {d}", .{@intFromEnum(mode)}) catch return error.BufferError;
@@ -354,9 +354,9 @@ pub const HyprlandController = struct {
     /// Uses hyprctl keyword to set monitor config
     pub fn setMonitorVrr(self: *HyprlandController, monitor_name: []const u8, enabled: bool) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         // Hyprland monitor rule with VRR: monitor=name,res,pos,scale,vrr,vrr_value
         // We need to get current monitor config and modify it
@@ -425,9 +425,9 @@ pub const HyprlandController = struct {
     /// Dispatch a Hyprland command
     pub fn dispatch(self: *HyprlandController, command: []const u8) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{ "hyprctl", "dispatch", command },
@@ -510,9 +510,9 @@ pub const SwayController = struct {
     /// Enable adaptive sync on output
     pub fn enableAdaptiveSync(self: *SwayController, output: []const u8) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output {s} adaptive_sync on", .{output}) catch return error.BufferError;
@@ -532,9 +532,9 @@ pub const SwayController = struct {
     /// Disable adaptive sync on output
     pub fn disableAdaptiveSync(self: *SwayController, output: []const u8) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         var cmd_buf: [256]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "output {s} adaptive_sync off", .{output}) catch return error.BufferError;
@@ -740,9 +740,9 @@ pub const MutterController = struct {
     /// Enable VRR experimental feature
     pub fn enableVrr(self: *MutterController) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{
@@ -765,9 +765,9 @@ pub const MutterController = struct {
     /// Disable VRR experimental feature
     pub fn disableVrr(self: *MutterController) !void {
         _ = self;
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
+        var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = debug_alloc.deinit();
+        const allocator = debug_alloc.allocator();
 
         const result = process.run(allocator, Io.Threaded.global_single_threaded.io(), .{
             .argv = &[_][]const u8{

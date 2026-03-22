@@ -500,10 +500,10 @@ pub fn getVrrEnabled(card: u32, connector_id: u32) !bool {
 }
 
 test "DrmManager init" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_alloc.deinit();
 
-    var manager = DrmManager.init(gpa.allocator());
+    var manager = DrmManager.init(debug_alloc.allocator());
     defer manager.deinit();
 }
 

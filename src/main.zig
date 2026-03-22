@@ -19,9 +19,9 @@ fn sleepNs(ns: u64) void {
 }
 
 pub fn main(init: process.Init.Minimal) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_alloc.deinit();
+    const allocator = debug_alloc.allocator();
 
     // Collect args into an ArrayList
     var args_list: std.ArrayList([]const u8) = .empty;

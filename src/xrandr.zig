@@ -365,9 +365,9 @@ pub const XrandrController = struct {
 
 /// Check if xrandr is available
 pub fn isAvailable() bool {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_alloc.deinit();
+    const allocator = debug_alloc.allocator();
 
     const io = Io.Threaded.global_single_threaded.io();
     const result = process.run(allocator, io, .{

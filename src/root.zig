@@ -28,7 +28,7 @@ pub const xrandr = @import("xrandr.zig");
 pub const version = std.SemanticVersion{
     .major = 0,
     .minor = 2,
-    .patch = 4,
+    .patch = 5,
 };
 
 /// VRR Mode
@@ -1154,7 +1154,7 @@ test "ConnectionType VRR support" {
 }
 
 test "FrameLimiter init" {
-    var limiter = FrameLimiter.init(144, .cpu);
+    const limiter = FrameLimiter.init(144, .cpu);
     try std.testing.expectEqual(@as(u32, 144), limiter.target_fps);
     try std.testing.expect(limiter.enabled);
 

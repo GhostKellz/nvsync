@@ -311,9 +311,9 @@ fn setMetaMode(allocator: mem.Allocator, display: []const u8, mode: NvidiaVrrMod
 
 /// Set frame rate limit via nvidia-settings
 pub fn setFrameLimit(fps: u32) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_alloc.deinit();
+    const allocator = debug_alloc.allocator();
 
     // __GL_MaxFramesAllowed is an environment variable, not nvidia-settings
     // But we can suggest the command
@@ -359,8 +359,8 @@ pub const NvidiaEnvVars = struct {
 
 /// Generate environment variables for optimal VRR gaming
 pub fn getVrrEnvVars(fps_limit: ?u32) std.ArrayList([2][]const u8) {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = debug_alloc.allocator();
 
     var vars = std.ArrayList([2][]const u8).init(allocator);
 
